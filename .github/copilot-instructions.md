@@ -35,13 +35,17 @@ two playback PCMs stay separate sinks.
 
 - Voice Out alone: chain runs in keepalive mode, sends silence.
 - Both PCMs open: the URB callback reads both substream buffers and mixes
-  them into each 5-7 frame packet (240 bytes nominal).
+  them into each 240-byte packet (fixed 6-frame cadence; see
+  `src/zg01_pcm.c` for why the device's variable feedback framing is
+  not followed for OUT sizing).
 - The out chain starts when either sink prepares and stops when both stop.
 
 ### Packet formats
 
-Playback packet: variable, 5-7 frames of 40 bytes (240 bytes nominal),
-paced by IN endpoint implicit feedback. Frame: Voice_L(4),
+Playback packet: constant 240 bytes = 6 frames of 40 bytes. The IN
+endpoint reports 5-7 frames per packet (~21ppm clock drift), but the
+device pops audibly on odd-sized OUT packets, so the driver sends the
+nominal cadence and the device absorbs the drift. Frame: Voice_L(4),
 Voice_R(4), Game_L(4), Game_R(4), 24 pad bytes. 32 ISO packets per URB,
 4 ms per URB, `MAX_URBS` 16 (64 ms buffering).
 
