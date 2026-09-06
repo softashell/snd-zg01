@@ -920,6 +920,18 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         } else if (!zg01_feedback_take(q, &plan, &id)) {
             return;
         }
+        /* The ZG01 pops on odd-sized OUT packets. The device's IN
+         * endpoint reports its framing honestly (5-7 frames/packet,
+         * ~+21ppm clock drift producing isolated 7-frame packets every
+         * ~1s), but the output side clicks audibly whenever an
+         * odd-sized packet lands. Windows never varies the packet size:
+         * constant 240-byte packets, drift absorbed by the device.
+         * Mirror that: send the nominal 6 frames per packet regardless
+         * of the measured plan. The plan is still taken (and counted)
+         * so feedback stats and gap-fallback liveness stay intact; only
+         * the sizing is ignored. */
+        for (i = 0; i < ISO_PKTS_OUT; i++)
+            plan.frames[i] = 6;
         urb = c->urbs[id];
         memset(urb->transfer_buffer, 0, c->iso_pkts * c->iso_pkt_size);
         used[0] = used[1] = 0;
