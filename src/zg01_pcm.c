@@ -72,10 +72,12 @@ static bool chain_consumers_running(struct zg01_dev *dev, struct zg01_chain *c)
     if (c == &dev->out_chain)
         return dev->streams[ZG01_GAME].running ||
                dev->streams[ZG01_VOICE_OUT].running;
-    return dev->streams[ZG01_VOICE_IN].running ||
-           dev->streams[ZG01_GAME].running ||
-           dev->streams[ZG01_VOICE_OUT].running ||
-           (dev->out_chain.allocated && zg01_chain_active(&dev->out_chain));
+    /* EXPERIMENT: IN runs only for real capture. The device firmware
+     * periodically restarts its IN endpoint mid-stream (zero-length
+     * packet + header counter reset, ~1/20s), and each restart pops
+     * the shared output. Fixed-cadence OUT no longer needs IN pacing,
+     * so keep IN off during playback-only to avoid triggering it. */
+    return dev->streams[ZG01_VOICE_IN].running;
 }
 
 static void zg01_chain_stop(struct zg01_dev *dev, struct zg01_chain *c);
@@ -839,6 +841,15 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
 
     if (dev->feedback_fault)
         return;
+    /* EXPERIMENT free-run: with IN off (playback-only), no plans will
+     * ever arrive. Skip priming and the plan-gap faulting; submit the
+     * nominal 6-frame cadence directly. URB ids still recycle through
+     * the pending ring, which is OUT-side bookkeeping. */
+    if (!zg01_chain_active(&dev->in_chain)) {
+        if (!dev->feedback_started)
+            dev->feedback_started = true;
+        dev->have_last_plan = true;
+    }
     if (!dev->feedback_started) {
         if (q->plans < 2)
             return;
@@ -863,8 +874,11 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                 total += dev->last_plan.frames[i];
             gap_fallback = true;
             /* Bound fallback to ~500 ms without a fresh valid plan,
-             * then fault playback instead of repeating stale timing. */
-            if (dev->feedback_gap_urbs >= ZG01_GAP_FALLBACK_MAX_URBS) {
+             * then fault playback instead of repeating stale timing.
+             * EXPERIMENT: no IN chain means no plans can ever arrive;
+             * the bound does not apply. */
+            if (zg01_chain_active(&dev->in_chain) &&
+                dev->feedback_gap_urbs >= ZG01_GAP_FALLBACK_MAX_URBS) {
                 dev->out_chain.stats.feedback_starved++;
                 zg01_feedback_xrun(dev);
                 return;
@@ -1377,8 +1391,13 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
         /* May sleep (cleanup drain); state re-checked inside. */
         ret = zg01_chain_start(dev, c);
-        if (!ret && c == &dev->out_chain)
+        /* EXPERIMENT: IN now starts only for capture. Tolerate the
+         * skip (-ECANCELED) when playback runs without capture. */
+        if (!ret && c == &dev->out_chain) {
             ret = zg01_chain_start(dev, &dev->in_chain);
+            if (ret == -ECANCELED)
+                ret = 0;
+        }
         if (ret) {
             mutex_lock(&dev->state_mutex);
             s->running = false;
