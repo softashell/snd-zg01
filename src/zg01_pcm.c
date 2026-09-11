@@ -167,6 +167,42 @@ static int zg01_chain_start(struct zg01_dev *dev, struct zg01_chain *c);
 static void zg01_chain_stop(struct zg01_dev *dev, struct zg01_chain *c);
 static void zg01_feedback_pump(struct zg01_dev *dev);
 
+/* Fault recovery: a transient idle fault drops the hold pair and
+ * drains both chains. Without a re-arm the device stays cold for the
+ * rest of the session (observed: IN dead after one starvation xrun
+ * while OUT keepalive cycled on alone). The fault paths run under
+ * dev->lock, so they only set the pending flag; this work item
+ * re-arms through the normal keepalive gate, which refuses
+ * capture-open, suspend, and disconnect states. Backoff bounds the
+ * arm/fault cycle on a persistently failing device: each fault
+ * doubles the delay up to keepalive_rearm_max. */
+static unsigned int keepalive_rearm_ms = 1000;
+module_param(keepalive_rearm_ms, uint, 0644);
+MODULE_PARM_DESC(keepalive_rearm_ms, "Backoff before keepalive re-arm after an idle fault in ms (0=disabled, default 1000)");
+static unsigned int keepalive_rearm_max = 60000;
+module_param(keepalive_rearm_max, uint, 0644);
+MODULE_PARM_DESC(keepalive_rearm_max, "Upper bound of the re-arm backoff in ms (default 60000)");
+
+static void zg01_keepalive_arm(struct zg01_dev *dev);
+
+void zg01_keepalive_rearm_fn(struct work_struct *work)
+{
+    struct zg01_dev *dev = container_of(work, struct zg01_dev,
+                                        keepalive_rearm_work.work);
+    unsigned long flags;
+
+    spin_lock_irqsave(&dev->lock, flags);
+    if (!dev->keepalive_rearm) {
+        spin_unlock_irqrestore(&dev->lock, flags);
+        return;
+    }
+    dev->keepalive_rearm = false;
+    spin_unlock_irqrestore(&dev->lock, flags);
+
+    dev_info(&dev->udev->dev, "keepalive re-arm after idle fault\n");
+    zg01_keepalive_arm(dev);
+}
+
 /* Arm the both-chains keepalive hold. Caller must NOT hold
  * state_mutex: zg01_chain_start takes it. Drain-final STOP may
  * still be draining OUT when hw_free/close run, so this
@@ -639,6 +675,7 @@ void zg01_stop_all_chains(struct zg01_dev *dev)
     dev->in_hold = false;
     dev->in_assist = false;
     dev->assist_deadline_ns = 0;
+    dev->keepalive_rearm = false;
     spin_unlock_irqrestore(&dev->lock, flags);
     zg01_chain_stop(dev, &dev->out_chain);
     zg01_chain_stop(dev, &dev->in_chain);
@@ -646,6 +683,7 @@ void zg01_stop_all_chains(struct zg01_dev *dev)
     /* Quiesce also takes state_mutex, so join it only after unlocking. */
     cancel_delayed_work_sync(&dev->out_chain.quiesce_work);
     cancel_delayed_work_sync(&dev->in_chain.quiesce_work);
+    cancel_delayed_work_sync(&dev->keepalive_rearm_work);
 }
 
 void zg01_drain_all_chains(struct zg01_dev *dev)
@@ -1160,6 +1198,22 @@ static void zg01_feedback_xrun_locked(struct zg01_dev *dev, bool include_capture
         dev->assist_deadline_ns = 0;
         if (!dev->streams[ZG01_VOICE_IN].enabled)
             zg01_chain_drain_locked(&dev->in_chain);
+    }
+    /* Driver-owned pair died with no consumer attached: schedule one
+     * keepalive re-arm after a backoff instead of leaving the device
+     * cold for the session. Real streams above keep their own
+     * recovery paths; a rearm already pending wins. */
+    if (keepalive_rearm_ms && !dev->keepalive_rearm &&
+        !dev->streams[ZG01_GAME].enabled &&
+        !dev->streams[ZG01_VOICE_OUT].enabled &&
+        !dev->streams[ZG01_VOICE_IN].enabled &&
+        !atomic_read(&dev->disconnecting) && !dev->suspended) {
+        unsigned int backoff = min(keepalive_rearm_ms << 1,
+                                   keepalive_rearm_max);
+
+        dev->keepalive_rearm = true;
+        mod_delayed_work(zg01_cleanup_wq, &dev->keepalive_rearm_work,
+                         msecs_to_jiffies(backoff));
     }
 
     /* OUT faults do not stop real capture. IN-chain death notifies
@@ -2214,8 +2268,10 @@ void zg01_suspend_pcm(struct zg01_dev *dev)
     spin_lock_irqsave(&dev->lock, flags);
     dev->out_hold = false;
     dev->in_hold = false;
+    dev->keepalive_rearm = false;
     spin_unlock_irqrestore(&dev->lock, flags);
     mutex_unlock(&dev->state_mutex);
+    cancel_delayed_work_sync(&dev->keepalive_rearm_work);
     for (i = 0; i < ZG01_N_STREAMS; i++) {
         if (dev->pcm_instances[i])
             snd_pcm_suspend_all(dev->pcm_instances[i]);

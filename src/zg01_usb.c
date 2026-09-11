@@ -119,6 +119,7 @@ static int zg01_probe(struct usb_interface *interface,
     atomic_set(&dev->in_chain.inflight, 0);
     INIT_WORK(&dev->out_chain.cleanup_work, zg01_chain_cleanup_fn);
     INIT_WORK(&dev->in_chain.cleanup_work, zg01_chain_cleanup_fn);
+    INIT_DELAYED_WORK(&dev->keepalive_rearm_work, zg01_keepalive_rearm_fn);
     INIT_DELAYED_WORK(&dev->out_chain.quiesce_work, zg01_chain_quiesce_fn);
     INIT_DELAYED_WORK(&dev->in_chain.quiesce_work, zg01_chain_quiesce_fn);
 

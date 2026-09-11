@@ -227,6 +227,8 @@ struct zg01_dev {
 
     bool device_initialized;                  /* vendor handshake + rate */
     bool suspended;                           /* state_mutex: block restarts during PM */
+    bool keepalive_rearm;                     /* dev->lock: fault recovery pending */
+    struct delayed_work keepalive_rearm_work; /* fault re-arm after backoff */
 
     atomic_t disconnecting;                   /* URB resubmission off */
     atomic_t disconnected;                    /* teardown-once latch */
@@ -250,6 +252,7 @@ void zg01_period_work_fn(struct work_struct *work);
 void zg01_xrun_work_fn(struct work_struct *work);
 void zg01_chain_cleanup_fn(struct work_struct *work);
 void zg01_chain_quiesce_fn(struct work_struct *work);
+void zg01_keepalive_rearm_fn(struct work_struct *work);
 
 /* zg01_control.c */
 int zg01_init_control(struct zg01_dev *dev);

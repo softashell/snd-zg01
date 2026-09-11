@@ -56,6 +56,20 @@ Each initialization failure logs its failing stage (for example
 `initialization failed at clock GET_CUR: -32`) instead of a bare
 `set_rate failed` line.
 
+## Idle-fault re-arm
+
+A transient idle fault drops the hold pair and drains both chains. Without
+recovery the device stayed cold for the rest of the session: one starvation
+xrun left IN dead while OUT keepalive cycled on alone.
+
+`keepalive_rearm_ms` (default 1000, 0 disables) schedules one keepalive
+re-arm after an idle fault with no enabled stream, doubling its backoff per
+fault up to `keepalive_rearm_max` (default 60000). The re-arm passes the
+normal keepalive gate, so capture-open, suspend, and disconnect states still
+refuse it. Enabled streams suppress the re-arm; their own recovery paths own
+the next start. Suspend and disconnect clear the pending flag and cancel the
+work item.
+
 ## Transient IN error experiment
 
 `in_error_grace_ms` defaults to 0, which retains strict feedback error handling.
