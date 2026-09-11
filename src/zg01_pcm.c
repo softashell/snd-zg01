@@ -1360,7 +1360,8 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                 if (grace)
                     gap_limit = max(gap_limit, DIV_ROUND_UP(grace, 4U));
                 if (!free_run && dev->feedback_gap_urbs >= gap_limit) {
-                    if (grace && dev->streams[ZG01_VOICE_IN].enabled) {
+                    if (grace && (dev->streams[ZG01_VOICE_IN].enabled ||
+                                  READ_ONCE(dev->in_hold))) {
                         /* Storm under real capture: free-run OUT on
                          * nominal cadence instead of faulting it.
                          * Log once per holdback; a valid plan lifts
@@ -1666,12 +1667,17 @@ static void zg01_iso_in(struct urb *urb)
 
                 if (transient && grace)
                     limit = DIV_ROUND_UP(grace, 4U);
-                /* Real capture owns a storming IN endpoint: transient
-                 * packet errors must not execute the shared OUT
-                 * transport at all. The pump free-runs on nominal
-                 * cadence until valid plans return. */
+                /* An intentionally running IN endpoint - real capture
+                 * or the keepalive hold - storms with device noise:
+                 * transient packet errors must not execute the shared
+                 * OUT transport at all while the grace is active. The
+                 * pump free-runs on nominal cadence until valid plans
+                 * return. Otherwise a storming keepalive IN executed
+                 * OUT every re-arm cycle (observed: 2 s fault loop,
+                 * 31 xruns, audio dead through every resume). */
                 if (transient && grace &&
-                    dev->streams[ZG01_VOICE_IN].enabled)
+                    (dev->streams[ZG01_VOICE_IN].enabled ||
+                     READ_ONCE(dev->in_hold)))
                     limit = UINT_MAX;
                 if (++dev->feedback_startup_urbs >= limit)
                     zg01_feedback_xrun_all(dev);
