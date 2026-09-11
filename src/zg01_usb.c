@@ -312,11 +312,16 @@ static int __init zg01_init(void)
 {
     int ret;
 
-    zg01_cleanup_wq = alloc_workqueue("zg01-cleanup", WQ_MEM_RECLAIM, 0);
+    /*
+     * Name an explicit CPU binding. Recent kernels warn when a workqueue
+     * sets neither WQ_PERCPU nor WQ_UNBOUND, and WQ_PERCPU keeps the
+     * behaviour these queues have always had.
+     */
+    zg01_cleanup_wq = alloc_workqueue("zg01-cleanup", WQ_MEM_RECLAIM | WQ_PERCPU, 0);
     if (!zg01_cleanup_wq)
         return -ENOMEM;
 
-    zg01_period_wq = alloc_workqueue("zg01-period", WQ_MEM_RECLAIM, 0);
+    zg01_period_wq = alloc_workqueue("zg01-period", WQ_MEM_RECLAIM | WQ_PERCPU, 0);
     if (!zg01_period_wq) {
         destroy_workqueue(zg01_cleanup_wq);
         zg01_cleanup_wq = NULL;
