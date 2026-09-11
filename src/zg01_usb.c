@@ -206,7 +206,7 @@ static void zg01_disconnect(struct usb_interface *interface)
         return;
     atomic_set(&dev->disconnecting, 1);
 
-    /* Stop cancels quiesce work before draining the transports. */
+    /* Block submissions and join late arming before cancelling quiesce. */
     zg01_stop_all_chains(dev);
     zg01_drain_all_chains(dev);
     flush_workqueue(zg01_period_wq);

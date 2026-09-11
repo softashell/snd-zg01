@@ -191,7 +191,7 @@ struct zg01_dev {
     bool feedback_started;                   /* dev->lock: priming complete */
     bool feedback_fault;                     /* latched until drained restart */
     unsigned int feedback_gap_urbs;          /* consecutive fallback URBs */
-    unsigned int feedback_startup_urbs;       /* bounded no-feedback startup */
+    unsigned int feedback_startup_urbs;       /* consecutive invalid IN URBs */
     u64 prime_deadline_ns;                   /* dev->lock: 0 = not priming */
     u64 prime_ready_ns;                      /* dev->lock: release timestamp */
     u64 prime_released_frame;                /* dev->lock: game queued_pos at release */
@@ -226,6 +226,7 @@ struct zg01_dev {
     struct mutex state_mutex;
 
     bool device_initialized;                  /* vendor handshake + rate */
+    bool suspended;                           /* state_mutex: block restarts during PM */
 
     atomic_t disconnecting;                   /* URB resubmission off */
     atomic_t disconnected;                    /* teardown-once latch */
