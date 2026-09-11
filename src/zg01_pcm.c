@@ -1491,6 +1491,18 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         /* Follow each validated IN plan. Windows captures show occasional
          * seven-frame inserts. This restores measured clock compensation
          * for an A/B test against the fixed six-frame workaround. */
+        /* Flatten first: the spread below must see the plan it will size
+         * from. Running it afterwards re-inflated a spread URB back to
+         * nominal and returned the tail hole (measured: 14 events of 64
+         * frames in a 15 s window with both options on). */
+        if (ignore_plans) {
+            for (i = 0; i < ISO_PKTS_OUT; i++) {
+                if (plan.frames[i] != 6) {
+                    plan.frames[i] = 6;
+                    c->stats.plan_frames_ignored++;
+                }
+            }
+        }
         if (even_fill && !priming) {
             unsigned int total = 0;
             unsigned int budget = UINT_MAX;
@@ -1512,14 +1524,6 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                     plan.frames[i] = base + (i < rem ? 1 : 0);
                 c->stats.even_fill_urbs++;
                 c->stats.even_fill_last_budget = budget;
-            }
-        }
-        if (ignore_plans) {
-            for (i = 0; i < ISO_PKTS_OUT; i++) {
-                if (plan.frames[i] != 6) {
-                    plan.frames[i] = 6;
-                    c->stats.plan_frames_ignored++;
-                }
             }
         }
         urb = c->urbs[id];
