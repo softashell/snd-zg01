@@ -970,10 +970,16 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
             for (i = 0; i < ISO_PKTS_OUT; i++)
                 total += q->plan[q->plan_head].frames[i];
             dev->feedback_gap_urbs = 0;
-        } else if (dev->have_last_plan && dev->feedback_started) {
+        } else if ((dev->have_last_plan && dev->feedback_started) ||
+                   (!dev->feedback_started &&
+                    zg01_chain_active(&dev->in_chain))) {
             /* Plan gap: keep OUT cadence on the last measured framing
              * for the bounded fallback window.  This is a continuity
-             * policy, not a measured rate-error guarantee. */
+             * policy, not a measured rate-error guarantee.
+             * Startup is the same shape with no last plan yet: submit
+             * nominal cadence at once instead of waiting for the first
+             * IN plan. Windows reaches full rate in 6-8 ms with no
+             * plan wait. The bound below caps a dead IN path. */
             total = 0;
             for (i = 0; i < ISO_PKTS_OUT; i++)
                 total += dev->last_plan.frames[i];
@@ -1033,7 +1039,12 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         if (gap_fallback)
             c->stats.feedback_starved++;
         if (gap_fallback) {
-            plan = dev->last_plan;
+            /* Startup has no last plan yet; force nominal sizing here
+             * (the loop below rewrites the same values either way). */
+            if (dev->have_last_plan && dev->feedback_started)
+                plan = dev->last_plan;
+            else
+                memset(&plan, 6, sizeof(plan));
             if (!zg01_feedback_pending_take(q, &id))
                 return;
         } else if (!zg01_feedback_take(q, &plan, &id)) {
