@@ -63,6 +63,19 @@ static unsigned int quiesce_ms = 3000;
 module_param(quiesce_ms, uint, 0644);
 MODULE_PARM_DESC(quiesce_ms, "Warm-hold window in ms after playback STOP (default 3000)");
 
+/* PipeWire suspends a sink a few seconds after playback stops, which
+ * CLOSES the PCM: hw_free fires, cancels the quiesce hold, and stops
+ * the chain — so every pause longer than the suspend timeout pays a
+ * cold epoch on resume. keepalive_ms extends the warm hold across
+ * close/hw_free instead of stopping, letting the OUT chain cycle
+ * driver-owned silence buffers with no consumer substream attached.
+ * Safe because the pump skips inactive consumers before touching any
+ * runtime dma_area, and chain URB buffers are allocated once and never
+ * freed outside disconnect. 0 keeps today's stop-at-close behavior. */
+static unsigned int keepalive_ms;
+module_param(keepalive_ms, uint, 0644);
+MODULE_PARM_DESC(keepalive_ms, "Keep OUT chain warm across PCM close in ms (0=off, default 0)");
+
 static struct zg01_stream *sub_to_stream(struct snd_pcm_substream *substream)
 {
     return substream->pcm->private_data;
@@ -103,6 +116,17 @@ static bool chain_consumers_running(struct zg01_dev *dev, struct zg01_chain *c)
 static bool zg01_hold_warm(bool draining)
 {
     return !draining;
+}
+
+/* Close/hw_free hold decision: with keepalive armed, playback close
+ * leaves the OUT chain cycling driver-owned silence instead of
+ * stopping, so a PipeWire suspend/resume cycle does not pay a cold
+ * epoch. Capture close never holds (IN stays capture-only). */
+static bool zg01_hold_across_close(struct zg01_dev *dev)
+{
+    return keepalive_ms &&
+           !dev->streams[ZG01_VOICE_IN].running &&
+           !dev->streams[ZG01_VOICE_IN].opened;
 }
 
 static void zg01_chain_stop(struct zg01_dev *dev, struct zg01_chain *c);
@@ -1336,8 +1360,13 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
     s->xrun_generation = 0;
     s->substream = NULL;
     spin_unlock_irqrestore(&dev->lock, flags);
-    if (!chain_consumers_running(dev, c))
+    if (c == &dev->out_chain && zg01_hold_across_close(dev)) {
+        /* Keepalive hold: see hw_free. */
+        mod_delayed_work(zg01_cleanup_wq, &c->quiesce_work,
+                         msecs_to_jiffies(keepalive_ms));
+    } else if (!chain_consumers_running(dev, c)) {
         zg01_chain_stop(dev, c);
+    }
     if (!chain_consumers_running(dev, &dev->in_chain))
         zg01_chain_stop(dev, &dev->in_chain);
     mutex_unlock(&dev->state_mutex);
@@ -1375,8 +1404,15 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
         ? &dev->in_chain : &dev->out_chain;
     unsigned long flags;
 
-    /* Warm-hold cancel runs outside state_mutex: quiesce takes it. */
-    cancel_delayed_work_sync(&dev->out_chain.quiesce_work);
+    /* Warm-hold cancel runs outside state_mutex: quiesce takes it.
+     * Skip the OUT cancel when keepalive will re-arm it below —
+     * otherwise this cancel kills the hold it is about to schedule
+     * (mod_delayed_work from the close paths, plus any hold left by
+     * the preceding STOP, must survive into the keepalive window). */
+    if (!(c == &dev->out_chain && keepalive_ms &&
+          !dev->streams[ZG01_VOICE_IN].running &&
+          !dev->streams[ZG01_VOICE_IN].opened))
+        cancel_delayed_work_sync(&dev->out_chain.quiesce_work);
     cancel_delayed_work_sync(&dev->in_chain.quiesce_work);
 
     mutex_lock(&dev->state_mutex);
@@ -1391,8 +1427,14 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
         !dev->streams[ZG01_VOICE_OUT].running)
         dev->in_assist = false;
     spin_unlock_irqrestore(&dev->lock, flags);
-    if (!chain_consumers_running(dev, c))
+    if (c == &dev->out_chain && zg01_hold_across_close(dev)) {
+        /* Keepalive: leave OUT cycling silence with no substream;
+         * the quiesce timer stops it keepalive_ms later. */
+        mod_delayed_work(zg01_cleanup_wq, &c->quiesce_work,
+                         msecs_to_jiffies(keepalive_ms));
+    } else if (!chain_consumers_running(dev, c)) {
         zg01_chain_stop(dev, c);
+    }
     if (!chain_consumers_running(dev, &dev->in_chain))
         zg01_chain_stop(dev, &dev->in_chain);
     mutex_unlock(&dev->state_mutex);
