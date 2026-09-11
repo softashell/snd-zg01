@@ -197,6 +197,8 @@ struct zg01_dev {
     u64 prime_released_frame;                /* dev->lock: game queued_pos at release */
     u64 prime_in_first_ns;                   /* dev->lock: first valid IN plan of epoch */
     bool in_assist;                          /* dev->lock: IN runs only for prime readiness */
+    bool in_hold;                            /* dev->lock: IN runs driver-owned for keepalive */
+    bool out_hold;                           /* dev->lock: OUT runs driver-owned for keepalive */
     bool out_silence;                        /* dev->lock: OUT runs with no playback (capture-owned) */
 
 #define ZG01_GAP_FALLBACK_MAX_URBS 125    /* ~500 ms at ~4 ms per URB */

@@ -70,9 +70,9 @@ MODULE_PARM_DESC(quiesce_ms, "Warm-hold window in ms after playback STOP (defaul
  * Safe because the pump skips inactive consumers before touching any
  * runtime dma_area, and chain URB buffers are allocated once and never
  * freed outside disconnect. 0 keeps today's stop-at-close behavior. */
-static unsigned int keepalive_ms;
+static unsigned int keepalive_ms = 600000;
 module_param(keepalive_ms, uint, 0644);
-MODULE_PARM_DESC(keepalive_ms, "Keep OUT chain warm across PCM close in ms (0=off, default 0)");
+MODULE_PARM_DESC(keepalive_ms, "Keep both chains warm across PCM close in ms; the device drops opening audio unless IN isoc keeps streaming (0=off, default 600000)");
 
 static struct zg01_stream *sub_to_stream(struct snd_pcm_substream *substream)
 {
@@ -99,7 +99,8 @@ static bool chain_consumers_running(struct zg01_dev *dev, struct zg01_chain *c)
     if (c == &dev->out_chain)
         return dev->streams[ZG01_GAME].running ||
                dev->streams[ZG01_VOICE_OUT].running ||
-               READ_ONCE(dev->out_silence);
+               READ_ONCE(dev->out_silence) ||
+               READ_ONCE(dev->out_hold);
     /* EXPERIMENT: IN runs only for real capture, plus the brief
      * priming-assist window (in_assist) that clocks the prime
      * release in playback-only mode. The device firmware
@@ -108,7 +109,8 @@ static bool chain_consumers_running(struct zg01_dev *dev, struct zg01_chain *c)
      * the shared output. Fixed-cadence OUT no longer needs IN pacing,
      * so keep IN off during playback-only to avoid triggering it. */
     return dev->streams[ZG01_VOICE_IN].running ||
-           READ_ONCE(dev->in_assist);
+           READ_ONCE(dev->in_assist) ||
+           READ_ONCE(dev->in_hold);
 }
 
 /* Warm-hold decision: normal STOP holds, drain-final STOP stops at once. */
@@ -120,12 +122,66 @@ static bool zg01_hold_warm(bool draining)
 /* Close/hw_free hold decision: with keepalive armed, playback close
  * leaves the OUT chain cycling driver-owned silence instead of
  * stopping, so a PipeWire suspend/resume cycle does not pay a cold
- * epoch. Capture close never holds (IN stays capture-only). */
+ * epoch. Capture close never holds (IN stays capture-only).
+ * Hardware trials (2026-09-08): only real IN isoc traffic keeps the
+ * device output path live — OUT silence alone, EP0 requests, control
+ * heartbeats, and bulk polls all failed to. So the hold now also
+ * keeps the IN chain cycling (driver-owned, no capture substream):
+ * the device stays in its IN+OUT live state through the window. */
 static bool zg01_hold_across_close(struct zg01_dev *dev)
 {
     return keepalive_ms &&
            !dev->streams[ZG01_VOICE_IN].running &&
            !dev->streams[ZG01_VOICE_IN].opened;
+}
+
+static int zg01_chain_start(struct zg01_dev *dev, struct zg01_chain *c);
+
+/* Arm the both-chains keepalive hold. Caller must NOT hold
+ * state_mutex: zg01_chain_start takes it. Drain-final STOP has
+ * already stopped OUT by the time hw_free/close run, so this
+ * RESTARTS OUT as a driver-owned silence chain (out_hold) and then
+ * starts IN (in_hold). IN plans keep the OUT pump fed; together
+ * they hold the device in its live IN+OUT state. */
+static void zg01_keepalive_arm(struct zg01_dev *dev)
+{
+    unsigned long flags;
+    bool start_out, start_in;
+    int ret;
+
+    if (!keepalive_ms)
+        return;
+
+    spin_lock_irqsave(&dev->lock, flags);
+    start_out = READ_ONCE(dev->out_chain.state) == ZG01_CHAIN_STOPPED;
+    start_in = READ_ONCE(dev->in_chain.state) == ZG01_CHAIN_STOPPED &&
+               !dev->streams[ZG01_VOICE_IN].running &&
+               !dev->streams[ZG01_VOICE_IN].opened;
+    if (start_out)
+        WRITE_ONCE(dev->out_hold, true);
+    if (start_in)
+        WRITE_ONCE(dev->in_hold, true);
+    spin_unlock_irqrestore(&dev->lock, flags);
+
+    if (start_out) {
+        ret = zg01_chain_start(dev, &dev->out_chain);
+        if (ret && ret != -ECANCELED) {
+            spin_lock_irqsave(&dev->lock, flags);
+            WRITE_ONCE(dev->out_hold, false);
+            spin_unlock_irqrestore(&dev->lock, flags);
+            dev_warn(&dev->udev->dev, "keepalive OUT start: %d\n", ret);
+            return;
+        }
+    }
+    if (start_in) {
+        ret = zg01_chain_start(dev, &dev->in_chain);
+        if (ret && ret != -ECANCELED) {
+            spin_lock_irqsave(&dev->lock, flags);
+            WRITE_ONCE(dev->in_hold, false);
+            spin_unlock_irqrestore(&dev->lock, flags);
+            dev_warn(&dev->udev->dev, "keepalive IN start: %d\n", ret);
+        }
+    }
 }
 
 static void zg01_chain_stop(struct zg01_dev *dev, struct zg01_chain *c);
@@ -213,14 +269,26 @@ void zg01_chain_quiesce_fn(struct work_struct *work)
 {
     struct zg01_chain *c = container_of(work, struct zg01_chain, quiesce_work.work);
     struct zg01_dev *dev = c->dev;
+    unsigned long flags;
 
     mutex_lock(&dev->state_mutex);
+    /* Keepalive window elapsed: drop the driver-owned hold flags so
+     * the consumers-running checks below stop both chains. Capture
+     * or playback still running keeps its chain regardless. */
+    spin_lock_irqsave(&dev->lock, flags);
+    WRITE_ONCE(dev->in_hold, false);
+    WRITE_ONCE(dev->out_hold, false);
+    spin_unlock_irqrestore(&dev->lock, flags);
     if (!chain_consumers_running(dev, c))
         zg01_chain_stop(dev, c);
     if (!chain_consumers_running(dev, &dev->in_chain))
         zg01_chain_stop(dev, &dev->in_chain);
     mutex_unlock(&dev->state_mutex);
 }
+
+/* Quiesce runs for either chain: when the keepalive window ends with
+ * no consumers, release the driver-owned IN hold before the checks
+ * above so both chains stop together. */
 
 /* ================================================================== */
 /* Chain primitives (state_mutex side)                                 */
@@ -1311,6 +1379,17 @@ static int zg01_pcm_open(struct snd_pcm_substream *substream)
         dev->open_count = 1;
     dev->last_open_jiffies = now;
 
+    /* Capture open takes ownership of the IN chain: drop any live
+     * keepalive hold so a later capture STOP does not find the flag
+     * latched and leave IN streaming forever. */
+    if (s->direction == SNDRV_PCM_STREAM_CAPTURE) {
+        unsigned long flags;
+
+        spin_lock_irqsave(&dev->lock, flags);
+        WRITE_ONCE(dev->in_hold, false);
+        spin_unlock_irqrestore(&dev->lock, flags);
+    }
+
     runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
                        SNDRV_PCM_INFO_INTERLEAVED |
                        SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_BATCH;
@@ -1367,6 +1446,7 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
     struct zg01_dev *dev = s->dev;
     struct zg01_chain *c = (s->direction == SNDRV_PCM_STREAM_CAPTURE)
         ? &dev->in_chain : &dev->out_chain;
+    bool arm_keepalive_in = false;
     unsigned long flags;
 
     /* Close can extend the hold again after hw_free. Join any expired
@@ -1385,9 +1465,10 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
         dev->out_silence = false;
     spin_unlock_irqrestore(&dev->lock, flags);
     if (c == &dev->out_chain && zg01_hold_across_close(dev)) {
-        /* Keepalive hold: see hw_free. */
+        /* Keepalive hold: see hw_free. Arming runs after the mutex. */
         mod_delayed_work(zg01_cleanup_wq, &c->quiesce_work,
                          msecs_to_jiffies(keepalive_ms));
+        arm_keepalive_in = true;
     } else if (!chain_consumers_running(dev, c)) {
         zg01_chain_stop(dev, c);
     }
@@ -1397,6 +1478,9 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
         !chain_consumers_running(dev, &dev->out_chain))
         zg01_chain_stop(dev, &dev->out_chain);
     mutex_unlock(&dev->state_mutex);
+
+    if (arm_keepalive_in)
+        zg01_keepalive_arm(dev);
 
     flush_work(&dev->out_chain.cleanup_work);
     flush_work(&dev->in_chain.cleanup_work);
@@ -1429,6 +1513,7 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
     struct zg01_dev *dev = s->dev;
     struct zg01_chain *c = (s->direction == SNDRV_PCM_STREAM_CAPTURE)
         ? &dev->in_chain : &dev->out_chain;
+    bool arm_keepalive_in = false;
     unsigned long flags;
 
     /* Join old quiesce callbacks before extending the hold. Re-arming
@@ -1453,9 +1538,13 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
     spin_unlock_irqrestore(&dev->lock, flags);
     if (c == &dev->out_chain && zg01_hold_across_close(dev)) {
         /* Keepalive: leave OUT cycling silence with no substream;
-         * the quiesce timer stops it keepalive_ms later. */
+         * the quiesce timer stops it keepalive_ms later. IN joins
+         * the hold: the device output path needs IN isoc liveness.
+         * Arming runs AFTER state_mutex is released — chain_start
+         * takes that mutex. */
         mod_delayed_work(zg01_cleanup_wq, &c->quiesce_work,
                          msecs_to_jiffies(keepalive_ms));
+        arm_keepalive_in = true;
     } else if (!chain_consumers_running(dev, c)) {
         zg01_chain_stop(dev, c);
     }
@@ -1465,6 +1554,9 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
         !chain_consumers_running(dev, &dev->out_chain))
         zg01_chain_stop(dev, &dev->out_chain);
     mutex_unlock(&dev->state_mutex);
+
+    if (arm_keepalive_in)
+        zg01_keepalive_arm(dev);
 
     flush_work(&dev->out_chain.cleanup_work);
     flush_work(&dev->in_chain.cleanup_work);
