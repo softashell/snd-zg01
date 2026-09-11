@@ -197,6 +197,7 @@ struct zg01_dev {
     u64 prime_released_frame;                /* dev->lock: game queued_pos at release */
     u64 prime_in_first_ns;                   /* dev->lock: first valid IN plan of epoch */
     bool in_assist;                          /* dev->lock: IN runs only for prime readiness */
+    u64 assist_deadline_ns;                  /* dev->lock: 0 = liveness assist off */
     bool in_hold;                            /* dev->lock: IN runs driver-owned for keepalive */
     bool out_hold;                           /* dev->lock: OUT runs driver-owned for keepalive */
     bool out_silence;                        /* dev->lock: OUT runs with no playback (capture-owned) */

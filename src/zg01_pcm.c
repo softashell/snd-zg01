@@ -38,6 +38,41 @@ static unsigned int prime_ms;
 module_param(prime_ms, uint, 0644);
 MODULE_PARM_DESC(prime_ms, "Silence-priming cap in ms per fresh OUT start (0=off, default 0)");
 
+/* Windows sends a vendor OUT control request (bRequest 0x0b, wValue
+ * 0x0060, no data phase) immediately before its per-start interface
+ * setup; see captures/2026-09-08_windows-usbmon-verification.md frame
+ * 16203. Its purpose is unknown. This replays the exact request once
+ * per fresh OUT epoch for a hardware A/B against the device-side
+ * discard window. Disabled by default. */
+static unsigned int vendor_start_req;
+module_param(vendor_start_req, uint, 0644);
+MODULE_PARM_DESC(vendor_start_req, "Send Windows start vendor request 0x0b/0x0060 per fresh OUT start (0=off, default 0)");
+
+/* Full Windows start triple: the vendor request above followed by
+ * SET_INTERFACE alt 1 on interfaces 1 and 2 (usbmon frames 16203,
+ * 16211, 16219). Windows resets the endpoints at EVERY start and
+ * hears no discard; the bare request without the reset correlated
+ * with discards in hardware trials. The interface reset is forced
+ * even when alt 1 is already current — that reset is the point.
+ * Interface 2 is only reset when its chain is stopped, so live
+ * capture is never killed. */
+static unsigned int vendor_start_seq;
+module_param(vendor_start_seq, uint, 0644);
+MODULE_PARM_DESC(vendor_start_seq, "Full Windows start per fresh OUT start: vendor request + forced SET_INTERFACE alt 1 on both streaming interfaces (0=off, default 0)");
+
+/* Liveness assist: hardware trials (2026-09-08) showed the device
+ * discards the first seconds of a fresh OUT stream whenever its IN
+ * pipe was idle, and passes audio from the first frame when IN is
+ * active around the start — with cold transport, no priming, no EP0
+ * requests. The device gates its output path on combined IN+OUT
+ * traffic. This runs IN for assist_ms on every fresh playback epoch
+ * (via in_assist), long enough to cover the discard window, then
+ * drains IN. Playback-only is IN-free again for the rest of the
+ * stream, keeping the firmware IN-restart pops out. */
+static unsigned int assist_ms;
+module_param(assist_ms, uint, 0644);
+MODULE_PARM_DESC(assist_ms, "Run IN for N ms at every fresh playback start so the device keeps its output path live (0=off, default 0)");
+
 #define PCM_BUFFER_BYTES_MAX_GAME   (1536 * 32)
 #define PCM_BUFFER_BYTES_MIN_GAME   (1536 * 2)
 /*
@@ -434,6 +469,39 @@ retry:
         spin_unlock_irqrestore(&dev->lock, flags);
         goto unlock;
     }
+    spin_unlock_irqrestore(&dev->lock, flags);
+
+    /* EXPERIMENT: Windows precedes every start with a vendor OUT
+     * request 0x0b/0x0060 (no data phase). Send it only on a fresh
+     * OUT epoch, outside dev->lock because usb_control_msg sleeps.
+     * vendor_start_seq subsumes vendor_start_req: the full Windows
+     * triple additionally forces SET_INTERFACE alt 1 on both
+     * streaming interfaces (skipping interface 2 while its chain is
+     * live). Failures are logged, not fatal. */
+    if (c == &dev->out_chain &&
+        (READ_ONCE(vendor_start_req) || READ_ONCE(vendor_start_seq))) {
+        ret = usb_control_msg(dev->udev, usb_sndctrlpipe(dev->udev, 0),
+                              0x0b, USB_DIR_OUT | USB_TYPE_VENDOR |
+                              USB_RECIP_DEVICE,
+                              0x0060, 0x0000, NULL, 0, 1000);
+        if (ret < 0)
+            dev_warn(&dev->udev->dev,
+                     "vendor start request failed: %d\n", ret);
+        if (READ_ONCE(vendor_start_seq)) {
+            ret = usb_set_interface(dev->udev, 1, 1);
+            if (ret < 0)
+                dev_warn(&dev->udev->dev,
+                         "start reset interface 1 failed: %d\n", ret);
+            if (READ_ONCE(dev->in_chain.state) == ZG01_CHAIN_STOPPED) {
+                ret = usb_set_interface(dev->udev, 2, 1);
+                if (ret < 0)
+                    dev_warn(&dev->udev->dev,
+                             "start reset interface 2 failed: %d\n", ret);
+            }
+        }
+    }
+
+    spin_lock_irqsave(&dev->lock, flags);
     if (c == &dev->out_chain) {
         zg01_feedback_reset(&dev->feedback);
         dev->have_last_plan = false;
@@ -464,6 +532,20 @@ retry:
          * RUNNING adoption returns above and preserves the current epoch. */
         dev->in_assist = dev->prime_deadline_ns &&
                          !dev->streams[ZG01_VOICE_IN].running;
+        /* Liveness assist (assist_ms): cover the device discard window
+         * with real IN traffic even when not priming. Same arming
+         * rules as prime assist: fresh playback epoch only, never
+         * when capture owns the IN chain. */
+        if (assist_ms && !dev->prime_deadline_ns &&
+            (dev->streams[ZG01_GAME].running ||
+             dev->streams[ZG01_VOICE_OUT].running) &&
+            !dev->streams[ZG01_VOICE_IN].running) {
+            dev->assist_deadline_ns = ktime_get_ns() +
+                (u64)assist_ms * NSEC_PER_MSEC;
+            dev->in_assist = true;
+        } else {
+            dev->assist_deadline_ns = 0;
+        }
         c->dev->prime_ready_ns = 0;
         c->dev->prime_released_frame = 0;
         c->dev->prime_in_first_ns = 0;
@@ -1131,6 +1213,18 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         urb = c->urbs[id];
         memset(urb->transfer_buffer, 0, c->iso_pkts * c->iso_pkt_size);
         used[0] = used[1] = 0;
+        /* Liveness assist expiry: once IN has covered the discard
+         * window, take it down unless real capture adopted it. Same
+         * unconditional-clear contract as the prime-release path. */
+        if (dev->assist_deadline_ns &&
+            ktime_get_ns() >= dev->assist_deadline_ns) {
+            dev->assist_deadline_ns = 0;
+            if (dev->in_assist) {
+                dev->in_assist = false;
+                if (!dev->streams[ZG01_VOICE_IN].running)
+                    zg01_chain_drain_locked(&dev->in_chain);
+            }
+        }
         /* Priming window: the device discards early audio. Consume and
          * drop the application's frames (silence stays in the buffer)
          * so ALSA's clock advances normally through the window.
