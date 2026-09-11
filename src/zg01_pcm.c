@@ -1128,11 +1128,15 @@ static void zg01_usb_stats_print(struct snd_info_buffer *buffer,
     } else {
         snd_iprintf(buffer, "out_length_mismatch %llu\nplan_frames_ignored %llu\n",
                     s->out_length_mismatch, s->plan_frames_ignored);
-        for (i = 5; i <= 7; i++)
-            snd_iprintf(buffer, "out_frames %d %llu\n", i, s->out_frames[i]);
+        for (i = 0; i <= 7; i++)
+            if (s->out_frames[i])
+                snd_iprintf(buffer, "out_frames %d %llu\n", i,
+                            s->out_frames[i]);
         if (s->even_fill_urbs)
-            snd_iprintf(buffer, "even_fill_urbs %llu\neven_fill_last_budget %llu\n",
-                        s->even_fill_urbs, s->even_fill_last_budget);
+            snd_iprintf(buffer,
+                        "even_fill_urbs %llu\neven_fill_last_budget %llu\neven_fill_deficit %llu\n",
+                        s->even_fill_urbs, s->even_fill_last_budget,
+                        s->even_fill_deficit);
         for (i = 0; i < 2; i++) {
             if (!s->out_short_frames[i])
                 continue;
@@ -1530,6 +1534,7 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                     plan.frames[i] = base + (i < rem ? 1 : 0);
                 c->stats.even_fill_urbs++;
                 c->stats.even_fill_last_budget = budget;
+                c->stats.even_fill_deficit += total - budget;
             }
         }
         urb = c->urbs[id];
