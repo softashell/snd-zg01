@@ -91,6 +91,16 @@ static unsigned int short_hold;
 module_param(short_hold, uint, 0644);
 MODULE_PARM_DESC(short_hold, "Repeat the last frame instead of zero padding when an active ring runs short (0=zeros, default 0)");
 
+/* Trial-only A/B, modelled on the vendor OUT isoc builder. When the
+ * application cannot cover the plan, the vendor spreads its frames
+ * evenly over all 32 descriptors (budget/32 frames each, plus one for a
+ * prefix) and carries the deficit into the next URB. Our driver instead
+ * zero-fills the tail, which was measured as 64 frames of silence 1-2
+ * times a second. This applies the vendor spread. 0 keeps the tail fill. */
+static unsigned int even_fill;
+module_param(even_fill, uint, 0644);
+MODULE_PARM_DESC(even_fill, "Spread available frames across all packets when the plan cannot be covered (0=tail fill, default 0)");
+
 #define PCM_BUFFER_BYTES_MAX_GAME   (1536 * 32)
 #define PCM_BUFFER_BYTES_MIN_GAME   (1536 * 2)
 /*
@@ -1114,6 +1124,9 @@ static void zg01_usb_stats_print(struct snd_info_buffer *buffer,
                     s->out_length_mismatch, s->plan_frames_ignored);
         for (i = 5; i <= 7; i++)
             snd_iprintf(buffer, "out_frames %d %llu\n", i, s->out_frames[i]);
+        if (s->even_fill_urbs)
+            snd_iprintf(buffer, "even_fill_urbs %llu\neven_fill_last_budget %llu\n",
+                        s->even_fill_urbs, s->even_fill_last_budget);
         for (i = 0; i < 2; i++) {
             if (!s->out_short_frames[i])
                 continue;
@@ -1478,6 +1491,29 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         /* Follow each validated IN plan. Windows captures show occasional
          * seven-frame inserts. This restores measured clock compensation
          * for an A/B test against the fixed six-frame workaround. */
+        if (even_fill && !priming) {
+            unsigned int total = 0;
+            unsigned int budget = UINT_MAX;
+
+            for (i = 0; i < ISO_PKTS_OUT; i++)
+                total += plan.frames[i];
+            for (n = 0; n < 2; n++)
+                if (oc[n].active && limit[n] < budget)
+                    budget = limit[n];
+            /* The vendor only takes its spread branch when the frame
+             * count covers every descriptor; below that it keeps nominal
+             * sizing, so mirror that and never emit zero-length packets. */
+            if (budget != UINT_MAX && budget >= ISO_PKTS_OUT &&
+                budget < total) {
+                unsigned int base = budget / ISO_PKTS_OUT;
+                unsigned int rem = budget % ISO_PKTS_OUT;
+
+                for (i = 0; i < ISO_PKTS_OUT; i++)
+                    plan.frames[i] = base + (i < rem ? 1 : 0);
+                c->stats.even_fill_urbs++;
+                c->stats.even_fill_last_budget = budget;
+            }
+        }
         if (ignore_plans) {
             for (i = 0; i < ISO_PKTS_OUT; i++) {
                 if (plan.frames[i] != 6) {

@@ -120,6 +120,8 @@ struct zg01_usb_stats {
     u64 out_short_last_used[2];
     u64 out_short_last_frames[2];
     u64 out_short_last_index[2];
+    u64 even_fill_urbs;                      /* URBs whose plan was spread */
+    u64 even_fill_last_budget;                /* frames available at the last one */
     u64 first_nonzero_copy_ns;
     u64 first_nonzero_copy_frame;
     u64 first_nonzero_submit_ns;
