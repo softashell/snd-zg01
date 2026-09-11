@@ -18,10 +18,22 @@ An expiry callback must not revoke a hold that running playback adopted.
 The last playback STOP schedules expiry again, including an existing paired hold
 at drain-final STOP. Without an existing hold, drain-final STOP stops OUT.
 
+When playback is running, OUT already has a real owner, so keepalive arms an
+IN-only hold (`in_hold` alone): it starts IN and unwinds on failure without
+touching OUT. A capture close under running playback takes the same path.
+Without this, a mid-playback IN death left the device deaf — RUNNING
+transport, zero audio — because the ZG01 gates its output path on combined
+IN+OUT liveness. Fault re-arm schedules only when real capture does not own IN.
+
 Suspend blocks keepalive and new chain starts before suspending the PCMs.
 Disconnect blocks late close/hw_free arming. Teardown joins earlier arming under
 `state_mutex`, then cancels expiry work outside that mutex. An earlier helper
 cannot leave a timer queued after teardown's final cancellation.
+
+Disconnect also closes the streaming sessions: after the chains drain it sends
+SET_INTERFACE alt 0 on interface 1 and then on interface 2, matching the Windows
+stop trace (frames 104307/104331). A hot `rmmod` without that close left
+firmware 1.50 wedged until a power cycle. Failures here are logged, not fatal.
 Runtime buffers remain separate from chain buffers, so idle OUT sends
 driver-owned silence without a PCM buffer.
 
@@ -36,8 +48,9 @@ must succeed. The clock setter must succeed and the clock getter must report
 48 kHz. The driver retries the clock pair up to three times.
 
 The five early vendor discovery reads and the commit-handshake transfers are
-advisory. Firmware 1.50 STALLs (`-EPIPE`) them unpredictably — three different
-requests across two power sessions, usbmon-verified. Their payloads are unused.
+advisory. Firmware 1.50 STALLs (`-EPIPE`) them unpredictably — the stalling
+set varies per power session, and one validated session stalled all seven
+vendor transfers while playback ran normally. Their payloads are unused.
 Initialization sends the complete legacy sequence every attempt: no request
 aborts the sequence, because a half-done sequence (interfaces left at alt 0,
 commit writes unsent) makes the next attempt stall more. Failed advisory
@@ -82,7 +95,16 @@ The grace covers successful empty packets and packet statuses `-EPROTO`,
 The pump uses its existing last-plan or nominal startup fallback.
 Malformed nonempty packets retain strict handling. Terminal URB cancellation,
 shutdown, and resubmit failure still drain the affected transport.
-The existing OUT fallback limit remains an independent bound.
+
+While the grace is active and IN is intentionally running — a real capture
+consumer or the keepalive `in_hold` — transient IN packet errors never fault
+the shared OUT transport at any bound. This covers both the IN-side
+consecutive-error limit and the OUT pump gap-fallback. The pump free-runs on
+its nominal cadence and logs `IN storm under capture: OUT free-running` once
+per storm. The first valid plan lifts the holdback and restores feedback
+pacing. The exemption is scoped to intentional IN: a capture-only rule turned
+the IN-only re-arm into a two-second fault loop, because each re-armed
+keepalive IN stormed and executed OUT through the IN-side limit.
 
 For a hardware A/B, start with 0 versus 100 while keeping all other parameters,
 clients, PCM buffer sizes, and test audio unchanged:
