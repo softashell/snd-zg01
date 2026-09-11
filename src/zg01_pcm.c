@@ -100,7 +100,8 @@ static bool chain_consumers_running(struct zg01_dev *dev, struct zg01_chain *c)
 {
     if (c == &dev->out_chain)
         return dev->streams[ZG01_GAME].running ||
-               dev->streams[ZG01_VOICE_OUT].running;
+               dev->streams[ZG01_VOICE_OUT].running ||
+               READ_ONCE(dev->out_silence);
     /* EXPERIMENT: IN runs only for real capture, plus the brief
      * priming-assist window (in_assist) that clocks the prime
      * release in playback-only mode. The device firmware
@@ -385,8 +386,13 @@ retry:
         c->stats.start_epoch++;
         /* Device discard-window priming: send pure silence for the
          * first prime_ms of every fresh OUT epoch, consuming and
-         * dropping the application's frames so ALSA's clock runs. */
-        c->dev->prime_deadline_ns = prime_ms ?
+         * dropping the application's frames so ALSA's clock runs.
+         * Armed only when a playback consumer runs: a capture-owned
+         * silence epoch has no application frames to protect, and a
+         * later playback adoption must not pay a stale window. */
+        c->dev->prime_deadline_ns = (prime_ms &&
+            (dev->streams[ZG01_GAME].running ||
+             dev->streams[ZG01_VOICE_OUT].running)) ?
             ktime_get_ns() + (u64)prime_ms * NSEC_PER_MSEC : 0;
         c->dev->prime_epoch = c->stats.start_epoch;
         c->dev->prime_ready_ns = 0;
@@ -1363,6 +1369,8 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
     s->generation++;
     s->xrun_generation = 0;
     s->substream = NULL;
+    if (c == &dev->in_chain)
+        dev->out_silence = false;
     spin_unlock_irqrestore(&dev->lock, flags);
     if (c == &dev->out_chain && zg01_hold_across_close(dev)) {
         /* Keepalive hold: see hw_free. */
@@ -1373,6 +1381,9 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
     }
     if (!chain_consumers_running(dev, &dev->in_chain))
         zg01_chain_stop(dev, &dev->in_chain);
+    if (c == &dev->in_chain &&
+        !chain_consumers_running(dev, &dev->out_chain))
+        zg01_chain_stop(dev, &dev->out_chain);
     mutex_unlock(&dev->state_mutex);
 
     flush_work(&dev->out_chain.cleanup_work);
@@ -1430,6 +1441,8 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
         !dev->streams[ZG01_GAME].running &&
         !dev->streams[ZG01_VOICE_OUT].running)
         dev->in_assist = false;
+    if (c == &dev->in_chain)
+        dev->out_silence = false;
     spin_unlock_irqrestore(&dev->lock, flags);
     if (c == &dev->out_chain && zg01_hold_across_close(dev)) {
         /* Keepalive: leave OUT cycling silence with no substream;
@@ -1441,6 +1454,9 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
     }
     if (!chain_consumers_running(dev, &dev->in_chain))
         zg01_chain_stop(dev, &dev->in_chain);
+    if (c == &dev->in_chain &&
+        !chain_consumers_running(dev, &dev->out_chain))
+        zg01_chain_stop(dev, &dev->out_chain);
     mutex_unlock(&dev->state_mutex);
 
     flush_work(&dev->out_chain.cleanup_work);
@@ -1594,6 +1610,23 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
         /* May sleep (cleanup drain); state re-checked inside. */
         ret = zg01_chain_start(dev, c);
+        /* Capture owns an OUT silence epoch when no playback runs:
+         * Windows never runs IN alone, both iso pipes always pair. */
+        if (!ret && c == &dev->in_chain &&
+            !dev->streams[ZG01_GAME].running &&
+            !dev->streams[ZG01_VOICE_OUT].running) {
+            spin_lock_irqsave(&dev->lock, flags);
+            dev->out_silence = true;
+            spin_unlock_irqrestore(&dev->lock, flags);
+            ret = zg01_chain_start(dev, &dev->out_chain);
+            if (ret == -ECANCELED)
+                ret = 0;
+            if (ret) {
+                spin_lock_irqsave(&dev->lock, flags);
+                dev->out_silence = false;
+                spin_unlock_irqrestore(&dev->lock, flags);
+            }
+        }
         /* EXPERIMENT: IN runs for capture, and briefly as prime
          * readiness signal (in_assist) on fresh playback-only
          * epochs. Warm adoption of a RUNNING OUT chain starts no new
@@ -1667,6 +1700,9 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
             !dev->streams[ZG01_GAME].running &&
             !dev->streams[ZG01_VOICE_OUT].running)
             dev->in_assist = false;
+        /* Capture-owned OUT silence ends with capture. */
+        if (c == &dev->in_chain)
+            dev->out_silence = false;
         spin_unlock_irqrestore(&dev->lock, flags);
         if (c == &dev->out_chain && zg01_hold_warm(draining) &&
             !chain_consumers_running(dev, c)) {
@@ -1679,6 +1715,9 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
         }
         if (!chain_consumers_running(dev, &dev->in_chain))
             zg01_chain_stop(dev, &dev->in_chain);
+        if (c == &dev->in_chain &&
+            !chain_consumers_running(dev, &dev->out_chain))
+            zg01_chain_stop(dev, &dev->out_chain);
         mutex_unlock(&dev->state_mutex);
         return 0;
 
@@ -1690,6 +1729,8 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
         s->xrun_generation = 0;
         if (c == &dev->out_chain)
             dev->in_assist = false;
+        if (c == &dev->in_chain)
+            dev->out_silence = false;
         spin_unlock_irqrestore(&dev->lock, flags);
         /* Async cancel only: _sync deadlocks under state_mutex. */
         cancel_delayed_work(&c->quiesce_work);
@@ -1698,6 +1739,9 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
             zg01_chain_stop(dev, c);
         if (!chain_consumers_running(dev, &dev->in_chain))
             zg01_chain_stop(dev, &dev->in_chain);
+        if (c == &dev->in_chain &&
+            !chain_consumers_running(dev, &dev->out_chain))
+            zg01_chain_stop(dev, &dev->out_chain);
         mutex_unlock(&dev->state_mutex);
         return 0;
 
