@@ -187,6 +187,7 @@ static void zg01_disconnect(struct usb_interface *interface)
 {
     struct zg01_dev *dev = usb_get_intfdata(interface);
     int i;
+    int ret;
 
     if (!dev)
         return;
@@ -224,6 +225,19 @@ static void zg01_disconnect(struct usb_interface *interface)
     dev->out_chain.allocated = false;
     dev->in_chain.allocated = false;
     mutex_unlock(&dev->state_mutex);
+
+    /* Firmware 1.50 wedges when hot reload kills streaming URBs without
+     * a session close: the next probe fails (-71) or the device resets
+     * its own USB stack (observed twice, clears only on power cycle).
+     * Windows ends every session by returning BOTH streaming interfaces
+     * to alt 0 (usbmon frames 104307/104331). Send the same stops here;
+     * failures are logged - a physically absent device ignores them. */
+    ret = usb_set_interface(interface_to_usbdev(interface), 1, 0);
+    if (ret < 0)
+        dev_info(&interface->dev, "disconnect stop interface 1: %d\n", ret);
+    ret = usb_set_interface(interface_to_usbdev(interface), 2, 0);
+    if (ret < 0)
+        dev_info(&interface->dev, "disconnect stop interface 2: %d\n", ret);
 
     /* Free URBs and buffers for real. */
     for (i = 0; i < MAX_URBS; i++) {
