@@ -112,6 +112,11 @@ struct zg01_usb_stats {
     u64 in_length_overflow;
     u64 out_length_mismatch;
     u64 out_frames[8];                       /* successful complete packets */
+    u64 first_nonzero_copy_ns;
+    u64 first_nonzero_copy_frame;
+    u64 first_nonzero_submit_ns;
+    u64 first_out_completion_ns;
+    u64 start_epoch;                         /* bumped per fresh OUT start */
     u64 last_error_ns;
     u64 feedback_valid;
     u64 feedback_invalid;
@@ -182,11 +187,17 @@ struct zg01_dev {
     struct zg01_in_trace in_trace;
     struct zg01_feedback_queue feedback;
     struct zg01_feedback_plan last_plan;     /* dev->lock: gap fallback */
-    bool have_last_plan;                     /* dev->lock */
+    bool have_last_plan;                     /* dev->lock: gap fallback */
     bool feedback_started;                   /* dev->lock: priming complete */
     bool feedback_fault;                     /* latched until drained restart */
     unsigned int feedback_gap_urbs;          /* consecutive fallback URBs */
     unsigned int feedback_startup_urbs;       /* bounded no-feedback startup */
+    u64 prime_deadline_ns;                   /* dev->lock: 0 = not priming */
+    u64 prime_ready_ns;                      /* dev->lock: release timestamp */
+    u64 prime_released_frame;                /* dev->lock: game queued_pos at release */
+    u64 prime_in_first_ns;                   /* dev->lock: first valid IN plan of epoch */
+    u64 prime_epoch;                         /* dev->lock: start_epoch the deadline belongs to */
+    bool in_assist;                          /* dev->lock: IN runs only for prime readiness */
 
 #define ZG01_GAP_FALLBACK_MAX_URBS 125    /* ~500 ms at ~4 ms per URB */
 

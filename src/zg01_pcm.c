@@ -27,6 +27,19 @@
 
 #include "zg01.h"
 
+/* The ZG01 intermittently discards the first fraction-of-a-second of a
+ * freshly started OUT stream (measured 0.4-1.5 s windows; host transport
+ * is clean in failing trials). Prime the device with silence on every
+ * fresh OUT start: consume and DROP the application's frames during the
+ * priming window. ALSA's clock keeps advancing (hw_ptr follows retired
+ * frames), so no EIO. prime_ms is a safety cap: the pump releases early
+ * on device readiness when an IN signal exists. 0 disables priming.
+ * Disabled by default: playback-only mode has no IN signal, so the cap
+ * always governed and desktop cold starts ate the full window. */
+static unsigned int prime_ms;
+module_param(prime_ms, uint, 0644);
+MODULE_PARM_DESC(prime_ms, "Silence-priming cap in ms per fresh OUT start (0=off, default 0)");
+
 #define PCM_BUFFER_BYTES_MAX_GAME   (1536 * 32)
 #define PCM_BUFFER_BYTES_MIN_GAME   (1536 * 2)
 /*
@@ -43,9 +56,12 @@
 #define PCM_PERIOD_BYTES_MIN_VOICE  (48)
 #define PCM_PERIOD_BYTES_MAX_VOICE  (48 * 16)
 
-/* Delay before an idle chain kept alive by rapid START/STOP suppression
- * is quiesced for real. */
-#define ZG01_QUIESCE_DELAY msecs_to_jiffies(200)
+/* Hold the chain warm across short clip gaps: any playback STOP schedules a
+ * quiesce instead of stopping, so a START within quiesce_ms adopts the
+ * running chain with no new OUT epoch and no prime. Tunable at runtime. */
+static unsigned int quiesce_ms = 3000;
+module_param(quiesce_ms, uint, 0644);
+MODULE_PARM_DESC(quiesce_ms, "Warm-hold window in ms after playback STOP (default 3000)");
 
 static struct zg01_stream *sub_to_stream(struct snd_pcm_substream *substream)
 {
@@ -72,12 +88,21 @@ static bool chain_consumers_running(struct zg01_dev *dev, struct zg01_chain *c)
     if (c == &dev->out_chain)
         return dev->streams[ZG01_GAME].running ||
                dev->streams[ZG01_VOICE_OUT].running;
-    /* EXPERIMENT: IN runs only for real capture. The device firmware
+    /* EXPERIMENT: IN runs only for real capture, plus the brief
+     * priming-assist window (in_assist) that clocks the prime
+     * release in playback-only mode. The device firmware
      * periodically restarts its IN endpoint mid-stream (zero-length
      * packet + header counter reset, ~1/20s), and each restart pops
      * the shared output. Fixed-cadence OUT no longer needs IN pacing,
      * so keep IN off during playback-only to avoid triggering it. */
-    return dev->streams[ZG01_VOICE_IN].running;
+    return dev->streams[ZG01_VOICE_IN].running ||
+           READ_ONCE(dev->in_assist);
+}
+
+/* Warm-hold decision: normal STOP holds, drain-final STOP stops at once. */
+static bool zg01_hold_warm(bool draining)
+{
+    return !draining;
 }
 
 static void zg01_chain_stop(struct zg01_dev *dev, struct zg01_chain *c);
@@ -326,6 +351,23 @@ retry:
         dev->feedback_gap_urbs = 0;
         dev->feedback_startup_urbs = 0;
         memset(c->completed_frames, 0, sizeof(c->completed_frames));
+        /* New OUT epoch: re-arm the first-event latches so every
+         * transport start reports its own startup timing. Live
+         * adoption (RUNNING above) keeps the current epoch. */
+        c->stats.first_nonzero_copy_ns = 0;
+        c->stats.first_nonzero_copy_frame = 0;
+        c->stats.first_nonzero_submit_ns = 0;
+        c->stats.first_out_completion_ns = 0;
+        c->stats.start_epoch++;
+        /* Device discard-window priming: send pure silence for the
+         * first prime_ms of every fresh OUT epoch, consuming and
+         * dropping the application's frames so ALSA's clock runs. */
+        c->dev->prime_deadline_ns = prime_ms ?
+            ktime_get_ns() + (u64)prime_ms * NSEC_PER_MSEC : 0;
+        c->dev->prime_epoch = c->stats.start_epoch;
+        c->dev->prime_ready_ns = 0;
+        c->dev->prime_released_frame = 0;
+        c->dev->prime_in_first_ns = 0;
         for (i = 0; i < MAX_URBS; i++) {
             memset(c->bufs[i], 0, c->iso_pkts * c->iso_pkt_size);
             zg01_feedback_pending(&dev->feedback, i);
@@ -651,6 +693,14 @@ static void zg01_usb_stats_print(struct snd_info_buffer *buffer,
                 s->completions, s->cancelled, s->urb_errors);
     snd_iprintf(buffer, "packets %llu\nunknown_status %llu\nlast_error_ns %llu\n",
                 s->packets, s->unknown_status, s->last_error_ns);
+    snd_iprintf(buffer, "first_nonzero_copy_ns %llu\n"
+                "first_nonzero_copy_frame %llu\n"
+                "first_nonzero_submit_ns %llu\n"
+                "first_out_completion_ns %llu\n"
+                "start_epoch %llu\n",
+                s->first_nonzero_copy_ns, s->first_nonzero_copy_frame,
+                s->first_nonzero_submit_ns, s->first_out_completion_ns,
+                s->start_epoch);
     snd_iprintf(buffer, "feedback_valid %llu\nfeedback_invalid %llu\n"
                 "feedback_starved %llu\nfeedback_overflow %llu\n"
                 "feedback_submit_errors %llu\nplayback_waits %llu\n"
@@ -683,6 +733,7 @@ static void zg01_usb_stats_read(struct snd_info_entry *entry,
     struct zg01_usb_stats *snapshot;
     unsigned long flags;
     u64 now;
+    u64 prime_ready_ns, prime_released_frame, prime_in_first_ns;
 
     /* Keep the snapshots off the kernel stack; format after releasing lock. */
     snapshot = kmalloc_array(2, sizeof(*snapshot), GFP_KERNEL);
@@ -693,11 +744,17 @@ static void zg01_usb_stats_read(struct snd_info_entry *entry,
     spin_lock_irqsave(&dev->lock, flags);
     snapshot[0] = dev->out_chain.stats;
     snapshot[1] = dev->in_chain.stats;
+    prime_ready_ns = dev->prime_ready_ns;
+    prime_released_frame = dev->prime_released_frame;
+    prime_in_first_ns = dev->prime_in_first_ns;
     now = ktime_get_ns();
     spin_unlock_irqrestore(&dev->lock, flags);
 
     snd_iprintf(buffer, "zg01_usb_stats_v1\nsnapshot_ns %llu\n", now);
     zg01_usb_stats_print(buffer, &snapshot[0], false);
+    snd_iprintf(buffer, "prime_ready_ns %llu\nprime_released_frame %llu\n"
+                "prime_in_first_ns %llu\n",
+                prime_ready_ns, prime_released_frame, prime_in_first_ns);
     zg01_usb_stats_print(buffer, &snapshot[1], true);
     kfree(snapshot);
 }
@@ -825,6 +882,21 @@ static void zg01_feedback_xrun_all(struct zg01_dev *dev)
     zg01_feedback_xrun_locked(dev, true);
 }
 
+/* Prime readiness: first valid IN plan of this epoch plus settle.
+ * In playback-only the IN chain is started briefly (in_assist) to
+ * provide this signal, then stopped once priming releases. The
+ * IN-restart pops that keep IN off mid-stream cannot be heard while
+ * the output is still priming silence. Called with dev->lock held. */
+#define ZG01_PRIME_READY_SETTLE_MS 50
+
+static bool zg01_prime_ready(struct zg01_dev *dev, u64 now)
+{
+    if (!dev->prime_in_first_ns)
+        return false;
+    return now - dev->prime_in_first_ns >=
+        (u64)ZG01_PRIME_READY_SETTLE_MS * NSEC_PER_MSEC;
+}
+
 /* dev->lock covers submit as well as DRAINING publication: IN callbacks must
  * never submit OUT after its stop path has begun draining. Maximum two
  * submitted OUT URBs bounds copy-ahead below the smallest playback ring. */
@@ -835,8 +907,11 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
     struct zg01_feedback_plan plan;
     struct out_consumer oc[2];
     unsigned int limit[2];
-    unsigned int id, total, used[2], i, f, n;
+    unsigned int id, total, used[2], i, f, n, j;
     struct urb *urb;
+    bool nonzero_urb;
+    bool submit_has_audio;
+    bool priming = false;
     int ret;
 
     if (dev->feedback_fault)
@@ -859,6 +934,7 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
            atomic_read(&c->inflight) < 2) {
         bool gap_fallback = false;
         bool defer = false;
+        nonzero_urb = false;
 
         if (q->plans && q->pending) {
             total = 0;
@@ -949,6 +1025,38 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         urb = c->urbs[id];
         memset(urb->transfer_buffer, 0, c->iso_pkts * c->iso_pkt_size);
         used[0] = used[1] = 0;
+        /* Priming window: the device discards early audio. Consume and
+         * drop the application's frames (silence stays in the buffer)
+         * so ALSA's clock advances normally through the window.
+         * Release early on device readiness, else at the deadline cap. */
+        if (dev->prime_deadline_ns) {
+            u64 now = ktime_get_ns();
+
+            if (zg01_prime_ready(dev, now) || now >= dev->prime_deadline_ns) {
+                dev->prime_deadline_ns = 0;
+                dev->prime_ready_ns = now;
+                /* Both consumers drop frames during priming; record
+                 * whichever playback stream is supplying audio. */
+                dev->prime_released_frame =
+                    dev->streams[ZG01_GAME].enabled ?
+                        dev->streams[ZG01_GAME].queued_pos :
+                        dev->streams[ZG01_VOICE_OUT].queued_pos;
+                /* Assist IN's job is done: it existed only to clock
+                 * this release. Clear unconditionally: if capture
+                 * adopted the IN chain mid-prime, a later capture
+                 * STOP must see consumers(IN) == false and take IN
+                 * down; a latched in_assist would keep IN streaming
+                 * during pure playback and reintroduce the firmware
+                 * IN-restart pops. */
+                if (dev->in_assist) {
+                    dev->in_assist = false;
+                    if (!dev->streams[ZG01_VOICE_IN].running)
+                        zg01_chain_drain_locked(&dev->in_chain);
+                }
+            } else {
+                priming = true;
+            }
+        }
         for (i = 0; i < ISO_PKTS_OUT; i++) {
             u8 *pkt = urb->transfer_buffer + i * ISO_PKT_SIZE_OUT;
 
@@ -963,8 +1071,22 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                     if (!oc[n].active || used[n] >= limit[n])
                         continue;
                     off = ((s->queued_pos + used[n]) % oc[n].rt->buffer_size) * 8;
-                    memcpy(pkt + f * 40 + (n == 0 ? 8 : 0),
-                           oc[n].rt->dma_area + off, 8);
+                    if (!priming) {
+                        memcpy(pkt + f * 40 + (n == 0 ? 8 : 0),
+                               oc[n].rt->dma_area + off, 8);
+                        for (j = 0; j < 8; j++) {
+                            if (oc[n].rt->dma_area[off + j]) {
+                                nonzero_urb = true;
+                                if (!c->stats.first_nonzero_copy_ns) {
+                                    c->stats.first_nonzero_copy_ns =
+                                        ktime_get_ns();
+                                    c->stats.first_nonzero_copy_frame =
+                                        s->queued_pos + used[n];
+                                }
+                                break;
+                            }
+                        }
+                    }
                     used[n]++;
                 }
             }
@@ -976,6 +1098,7 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
             c->generation[id][n] = oc[n].s->generation;
         }
         atomic_inc(&c->inflight);
+        submit_has_audio = nonzero_urb;
         ret = usb_submit_urb(urb, GFP_ATOMIC);
         if (ret) {
             atomic_dec(&c->inflight);
@@ -984,6 +1107,8 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
             zg01_feedback_xrun(dev);
             return;
         }
+        if (submit_has_audio && !c->stats.first_nonzero_submit_ns)
+            c->stats.first_nonzero_submit_ns = ktime_get_ns();
         if (gap_fallback)
             dev->feedback_gap_urbs++;
         for (n = 0; n < 2; n++) {
@@ -1001,11 +1126,15 @@ static void zg01_iso_out(struct urb *urb)
     struct zg01_dev *dev = c->dev;
     unsigned long flags;
     unsigned int id, n;
+    u64 now;
     bool terminal = urb->status == -ENOENT || urb->status == -ECONNRESET ||
                     urb->status == -ESHUTDOWN;
 
     spin_lock_irqsave(&dev->lock, flags);
-    zg01_usb_stats_account(&c->stats, urb, false, ktime_get_ns());
+    now = ktime_get_ns();
+    zg01_usb_stats_account(&c->stats, urb, false, now);
+    if (!urb->status && !c->stats.first_out_completion_ns)
+        c->stats.first_out_completion_ns = now;
     for (id = 0; id < MAX_URBS && c->urbs[id] != urb; id++)
         ;
     atomic_dec(&c->inflight);
@@ -1101,6 +1230,8 @@ static void zg01_iso_in(struct urb *urb)
             (dev->feedback.pending || atomic_read(&dev->out_chain.inflight))) {
             dev->last_plan = plan;
             dev->have_last_plan = true;
+            if (dev->prime_deadline_ns && !dev->prime_in_first_ns)
+                dev->prime_in_first_ns = ktime_get_ns();
             if (!zg01_feedback_push(&dev->feedback, &plan)) {
                 c->stats.feedback_overflow++;
                 zg01_feedback_xrun(dev);
@@ -1244,6 +1375,10 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
         ? &dev->in_chain : &dev->out_chain;
     unsigned long flags;
 
+    /* Warm-hold cancel runs outside state_mutex: quiesce takes it. */
+    cancel_delayed_work_sync(&dev->out_chain.quiesce_work);
+    cancel_delayed_work_sync(&dev->in_chain.quiesce_work);
+
     mutex_lock(&dev->state_mutex);
     s->running = false;
     spin_lock_irqsave(&dev->lock, flags);
@@ -1251,6 +1386,10 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
     s->generation++;
     s->xrun_generation = 0;
     s->substream = NULL;
+    if (c == &dev->out_chain &&
+        !dev->streams[ZG01_GAME].running &&
+        !dev->streams[ZG01_VOICE_OUT].running)
+        dev->in_assist = false;
     spin_unlock_irqrestore(&dev->lock, flags);
     if (!chain_consumers_running(dev, c))
         zg01_chain_stop(dev, c);
@@ -1319,20 +1458,38 @@ static int zg01_pcm_prepare(struct snd_pcm_substream *substream)
     /* Playback also owns IN for implicit feedback. Never reset a live
      * interface when capture joins/leaves or either playback PCM joins. */
     if (READ_ONCE(dev->in_chain.state) == ZG01_CHAIN_STOPPED) {
-        ret = usb_set_interface(dev->udev, 2, 1);
-        if (ret < 0) {
+        struct usb_interface *iface;
+
+        iface = usb_ifnum_to_if(dev->udev, 2);
+        if (!iface) {
             mutex_unlock(&dev->state_mutex);
-            return ret;
+            return -ENODEV;
+        }
+        if (iface->cur_altsetting->desc.bAlternateSetting != 1) {
+            ret = usb_set_interface(dev->udev, 2, 1);
+            if (ret < 0) {
+                mutex_unlock(&dev->state_mutex);
+                return ret;
+            }
         }
     }
     ret = zg01_chain_alloc(dev, &dev->in_chain, ZG01_EP_IN, 2,
                            ISO_PKTS_IN, ISO_PKT_SIZE_IN, false);
     if (!ret && s->direction != SNDRV_PCM_STREAM_CAPTURE) {
         if (READ_ONCE(dev->out_chain.state) == ZG01_CHAIN_STOPPED) {
-            ret = usb_set_interface(dev->udev, 1, 1);
-            if (ret < 0) {
+            struct usb_interface *iface;
+
+            iface = usb_ifnum_to_if(dev->udev, 1);
+            if (!iface) {
                 mutex_unlock(&dev->state_mutex);
-                return ret;
+                return -ENODEV;
+            }
+            if (iface->cur_altsetting->desc.bAlternateSetting != 1) {
+                ret = usb_set_interface(dev->udev, 1, 1);
+                if (ret < 0) {
+                    mutex_unlock(&dev->state_mutex);
+                    return ret;
+                }
             }
         }
         ret = zg01_chain_alloc(dev, &dev->out_chain, ZG01_EP_OUT, 1,
@@ -1367,7 +1524,7 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
     struct zg01_dev *dev = s->dev;
     struct zg01_chain *c = (s->direction == SNDRV_PCM_STREAM_CAPTURE)
         ? &dev->in_chain : &dev->out_chain;
-    bool rapid;
+    bool draining;
     int ret;
     unsigned long flags;
 
@@ -1391,12 +1548,36 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
         /* May sleep (cleanup drain); state re-checked inside. */
         ret = zg01_chain_start(dev, c);
-        /* EXPERIMENT: IN now starts only for capture. Tolerate the
-         * skip (-ECANCELED) when playback runs without capture. */
+        /* EXPERIMENT: IN runs for capture, and briefly as prime
+         * readiness signal (in_assist) on fresh playback-only
+         * epochs. Warm adoption of a RUNNING OUT chain starts no new
+         * epoch and needs no assist. */
         if (!ret && c == &dev->out_chain) {
+            if (!dev->streams[ZG01_VOICE_IN].running &&
+                READ_ONCE(dev->prime_deadline_ns)) {
+                spin_lock_irqsave(&dev->lock, flags);
+                /* Fresh epoch only: a warm-held chain may still carry
+                 * an unreleased deadline from its previous epoch.
+                 * Compare the latched epoch of that deadline against
+                 * the current one so adoption never re-arms assist. */
+                if (dev->prime_deadline_ns &&
+                    dev->prime_epoch == dev->out_chain.stats.start_epoch &&
+                    !dev->in_assist) {
+                    dev->in_assist = true;
+                    dev->prime_in_first_ns = 0;
+                }
+                spin_unlock_irqrestore(&dev->lock, flags);
+            }
             ret = zg01_chain_start(dev, &dev->in_chain);
             if (ret == -ECANCELED)
                 ret = 0;
+            if (!ret) {
+                /* Playback-only has no IN callback to drive the first
+                 * OUT submission. Pump after START publishes RUNNING. */
+                spin_lock_irqsave(&dev->lock, flags);
+                zg01_feedback_pump(dev);
+                spin_unlock_irqrestore(&dev->lock, flags);
+            }
         }
         if (ret) {
             mutex_lock(&dev->state_mutex);
@@ -1404,6 +1585,10 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
             spin_lock_irqsave(&dev->lock, flags);
             s->enabled = false;
             s->xrun_generation = 0;
+            if (c == &dev->out_chain &&
+                !dev->streams[ZG01_GAME].running &&
+                !dev->streams[ZG01_VOICE_OUT].running)
+                dev->in_assist = false;
             spin_unlock_irqrestore(&dev->lock, flags);
             if (!chain_consumers_running(dev, &dev->out_chain))
                 zg01_chain_stop(dev, &dev->out_chain);
@@ -1415,31 +1600,37 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
         return ret;
 
     case SNDRV_PCM_TRIGGER_STOP:
-        /* Rapid START/STOP burst detection (PipeWire reconfiguration) */
+        /* Clip-gap warm hold: every playback STOP keeps the OUT chain
+         * cycling silence. Burst counters stay for diagnostics only. */
         if (time_before(jiffies,
                         s->last_trigger_jiffies + msecs_to_jiffies(100)))
             s->trigger_count++;
         else
             s->trigger_count = 1;
         s->last_trigger_jiffies = jiffies;
-        rapid = s->trigger_count > 3;
+        draining = substream->runtime &&
+            substream->runtime->status->state == SNDRV_PCM_STATE_DRAINING;
 
         s->running = false;
         spin_lock_irqsave(&dev->lock, flags);
         s->enabled = false;
         s->generation++;
         s->xrun_generation = 0;
+        /* Prime assist ends with the playback that requested it. */
+        if (c == &dev->out_chain &&
+            !dev->streams[ZG01_GAME].running &&
+            !dev->streams[ZG01_VOICE_OUT].running)
+            dev->in_assist = false;
         spin_unlock_irqrestore(&dev->lock, flags);
-        if (rapid) {
+        if (c == &dev->out_chain && zg01_hold_warm(draining) &&
+            !chain_consumers_running(dev, c)) {
             /* Keep the chain cycling (silence); the quiesce timer
              * stops it if no START follows. */
             mod_delayed_work(zg01_cleanup_wq, &c->quiesce_work,
-                             ZG01_QUIESCE_DELAY);
-            mutex_unlock(&dev->state_mutex);
-            return 0;
-        }
-        if (!chain_consumers_running(dev, c))
+                             msecs_to_jiffies(quiesce_ms));
+        } else if (!chain_consumers_running(dev, c)) {
             zg01_chain_stop(dev, c);
+        }
         if (!chain_consumers_running(dev, &dev->in_chain))
             zg01_chain_stop(dev, &dev->in_chain);
         mutex_unlock(&dev->state_mutex);
@@ -1451,7 +1642,12 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
         s->enabled = false;
         s->generation++;
         s->xrun_generation = 0;
+        if (c == &dev->out_chain)
+            dev->in_assist = false;
         spin_unlock_irqrestore(&dev->lock, flags);
+        /* Async cancel only: _sync deadlocks under state_mutex. */
+        cancel_delayed_work(&c->quiesce_work);
+        cancel_delayed_work(&dev->in_chain.quiesce_work);
         if (!chain_consumers_running(dev, c))
             zg01_chain_stop(dev, c);
         if (!chain_consumers_running(dev, &dev->in_chain))
