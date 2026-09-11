@@ -213,15 +213,45 @@ static void zg01_keepalive_arm(struct zg01_dev *dev)
 {
     unsigned long flags;
     int ret;
+    bool playback_running;
 
     /* Join old expiry work before publishing new demand. */
     cancel_delayed_work_sync(&dev->out_chain.quiesce_work);
     cancel_delayed_work_sync(&dev->in_chain.quiesce_work);
+
     mutex_lock(&dev->state_mutex);
-    if (!zg01_hold_across_close(dev) ||
-        dev->streams[ZG01_GAME].running ||
-        dev->streams[ZG01_VOICE_OUT].running) {
+    playback_running = dev->streams[ZG01_GAME].running ||
+                        dev->streams[ZG01_VOICE_OUT].running;
+    if (!zg01_hold_across_close(dev)) {
         mutex_unlock(&dev->state_mutex);
+        return;
+    }
+    if (playback_running) {
+        /* Real playback owns OUT; the device still needs IN liveness.
+         * Arm an IN-only hold instead of bailing: a capture close or
+         * fault during playback otherwise left IN dead while OUT ran
+         * into a deaf device (observed: RUNNING transport, no audio). */
+        spin_lock_irqsave(&dev->lock, flags);
+        dev->in_hold = true;
+        spin_unlock_irqrestore(&dev->lock, flags);
+        mutex_unlock(&dev->state_mutex);
+        ret = zg01_chain_start(dev, &dev->in_chain);
+        dev_info(&dev->udev->dev, "keepalive: IN-only start %d\n", ret);
+        mutex_lock(&dev->state_mutex);
+        spin_lock_irqsave(&dev->lock, flags);
+        if (ret || !dev->in_hold ||
+            !zg01_chain_active(&dev->in_chain)) {
+            dev->in_hold = false;
+            spin_unlock_irqrestore(&dev->lock, flags);
+            if (!chain_consumers_running(dev, &dev->in_chain))
+                zg01_chain_stop(dev, &dev->in_chain);
+        } else {
+            spin_unlock_irqrestore(&dev->lock, flags);
+        }
+        mutex_unlock(&dev->state_mutex);
+        if (ret && ret != -ECANCELED && ret != -ENODEV &&
+            ret != -EHOSTUNREACH)
+            dev_warn(&dev->udev->dev, "keepalive IN-only start: %d\n", ret);
         return;
     }
     spin_lock_irqsave(&dev->lock, flags);
@@ -1205,8 +1235,6 @@ static void zg01_feedback_xrun_locked(struct zg01_dev *dev, bool include_capture
      * cold for the session. Real streams above keep their own
      * recovery paths; a rearm already pending wins. */
     if (keepalive_rearm_ms && !dev->keepalive_rearm &&
-        !dev->streams[ZG01_GAME].enabled &&
-        !dev->streams[ZG01_VOICE_OUT].enabled &&
         !dev->streams[ZG01_VOICE_IN].enabled &&
         !atomic_read(&dev->disconnecting) && !dev->suspended) {
         unsigned int backoff = min(keepalive_rearm_ms << 1,
@@ -1797,6 +1825,8 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
      * probe and idle IN never streams. */
     if (c == &dev->in_chain && !chain_consumers_running(dev, &dev->in_chain) &&
         zg01_hold_across_close(dev)) {
+        /* Also fires while playback runs: the IN-only arm path
+         * restores IN liveness for a running OUT consumer. */
         arm_keepalive_in = true;
     } else if (!chain_consumers_running(dev, &dev->in_chain)) {
         dev_info(&dev->udev->dev, "close %s: stop IN (no consumers, hold=%d)\n",
