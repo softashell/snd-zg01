@@ -36,31 +36,36 @@ two playback PCMs stay separate sinks.
 
 - Either playback PCM alone supplies audio in its own frame slots.
 - When both playback PCMs run, the pump copies both buffers into each
-  240-byte packet. Inactive slots contain silence.
+  200–280-byte packet. Inactive slots contain silence.
 - Capture owns OUT as well as IN, including when capture joins playback.
   Prepare allocates both chains; START starts or adopts them.
 - Playback-only runs OUT without IN by default. Optional priming briefly
   runs IN assist, armed only during a fresh OUT initialization.
 - Normal playback STOP can hold OUT for `quiesce_ms` (default 3000).
-  Drain-final STOP does not hold. `keepalive_ms` (default 0) can extend
-  the hold across playback close when capture is neither open nor running.
+  `keepalive_ms` (default 600000) restarts or adopts BOTH chains across close
+  when capture is neither open nor running. Arm expiry after chain starts.
+  An existing paired hold survives drain-final STOP, which schedules expiry.
+  Without that hold, drain-final STOP stops OUT immediately.
+- Hold demand must survive DRAINING while chain_start joins cleanup.
+  Failed starts and capture takeover release both flags. Suspend/disconnect
+  block late arming. Expiry cannot revoke a hold adopted by live playback.
 - `prime_ms` defaults to 0. Enabling it drops application frames during
   silence priming. Valid IN plus 50 ms is an experimental release heuristic,
   not proof of audible readiness. Warm adoption does not re-arm assist.
 
 ### Packet formats
 
-Playback packet: constant 240 bytes = 6 frames of 40 bytes. The IN
-endpoint reports 5-7 frames per packet (~21ppm clock drift). Fixed OUT
-sizing is a Linux workaround for clicks observed with variable sizes,
-not a verified device drift-absorption mechanism. Frame: Voice_L(4),
+Playback packet: 200–280 bytes = 5–7 frames of 40 bytes when IN plans
+supply pacing. Without IN, free-run uses nominal six-frame packets.
+The IN endpoint reports 5–7 frames per packet (~21 ppm observed drift).
+Frame: Voice_L(4),
 Voice_R(4), Game_L(4), Game_R(4), 24 pad bytes. 32 ISO packets per URB,
 4 ms per URB, `MAX_URBS` 16 (64 ms buffering).
 
 Capture packet: variable, 5-7 frames of 16 bytes plus an 8-byte header
 (counter + length) and 4-byte trailer; 108 bytes nominal, 124-byte
-buffer. When IN runs, the pump consumes its plans for liveness but keeps
-OUT sizing fixed. Fresh IN startup resets its observation window without
+buffer. When IN runs, the pump follows validated frame-count plans.
+Fresh IN startup resets its observation window without
 resetting live OUT submissions. Playback-only free-run is not starvation.
 
 ### Rates
@@ -70,7 +75,9 @@ The device clock is shared across interfaces; the driver always
 initializes it at 48 kHz. The vendor handshake
 in prepare resets both interfaces to alt 0, so it runs only when no chain is
 streaming (`device_initialized` flag plus chain-state checks under
-`state_mutex`).
+`state_mutex`). Initialization failures return to ALSA without setting
+`device_initialized`. Check control lengths, interface results, and the
+48 kHz clock readback before publishing success.
 
 ### Streaming lifecycle
 
@@ -89,8 +96,11 @@ Suspend stops both chains and forces re-init on the next prepare;
   URBs; prepare requires both chains STOPPED before running it.
 - USB control buffers must be heap allocated, never on stack.
 - IN errors have bounded startup tolerance. After valid feedback begins,
-  malformed IN faults active paired transport; terminal resubmit statuses
-  also use the drain path. Do not label these paths benign without testing.
+  strict mode faults invalid IN immediately. `in_error_grace_ms` (default 0,
+  cap 500) can tolerate transient packet errors, never malformed timing plans.
+  Terminal resubmit statuses still drain. See `docs/STARTUP_RECOVERY.md`.
+- Do not count free-run completions as feedback starvation. Count a transport
+  fault once per OUT fault latch, but preserve notifications to real capture.
 - The Makefile auto-detects clang kernels via `CONFIG_CC_IS_CLANG`. Do not
   hardcode `LLVM=1`.
 - Do not add `EXPORT_SYMBOL` for intra-module symbols.

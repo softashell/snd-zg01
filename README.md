@@ -13,7 +13,7 @@ three PCM devices:
 
 | PCM device | Name | Direction | Rates | Packet |
 |---|---|---|---|---|
-| 0 | Game Out | playback | 48 kHz | 240 B: 6 frames x 40 B |
+| 0 | Game Out | playback | 48 kHz | 200–280 B: 5–7 frames x 40 B, 240 B nominal |
 | 1 | Voice Out | playback | 48 kHz | shared EP 0x01 with Game Out |
 | 2 | Voice In | capture | 48 kHz | 108 B nominal: 8 B header, 5-7 frames x 16 B, 4 B trailer |
 
@@ -22,10 +22,10 @@ packages install a UCM profile, so PipeWire shows the devices as separate
 sinks named Game Out, Voice Out, and Voice In. Without it, userspace falls
 back to the single generic stereo profile and only Game Out is exposed.
 
-A single out chain serves both playback PCMs. When only Voice Out runs, the
-chain sends keepalive silence on the shared endpoint. When both run, the URB
-callback mixes both PCM streams into each packet. This preserves the two
-sinks without moving the mix into userspace.
+A single OUT chain serves both playback PCMs. Each consumer supplies its own
+frame slots, with silence in inactive slots. Valid IN plans supply variable
+framing when IN runs. Playback-only free-run uses nominal six-frame packets.
+Both-chain keepalive can preserve the live transport across playback close.
 
 ## Install
 
@@ -94,14 +94,16 @@ The card offers three PCM devices: `hw:N,0` Game Out, `hw:N,1` Voice Out,
 same way.
 
 ```bash
-# Game Out
-speaker-test -D hw:zg01,0 -c 2 -r 48000 -F S32_LE -t sine -f 440 -l 1
+# Continuous stereo tone avoids channel-switching clicks.
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=10" -ar 48000 -ac 2 -c:a pcm_s32le /tmp/zg01-tone.wav
+aplay -D hw:zg01,0 /tmp/zg01-tone.wav
 # Voice In
 arecord -D hw:zg01,2 -f S32_LE -r 48000 -c 2 -d 5 test.wav
 ```
 
-Voice In logs bursts of `-ECONNRESET` on the first open. They are benign;
-the chain resubmits.
+Do not treat all startup errors as benign. Inspect per-packet statuses and
+XRUN deltas. See [startup recovery](docs/STARTUP_RECOVERY.md) for keepalive,
+initialization checks, and the optional transient-IN grace experiment.
 
 ## DKMS
 

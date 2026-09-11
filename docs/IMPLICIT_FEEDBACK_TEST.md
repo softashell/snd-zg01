@@ -1,5 +1,9 @@
 # Experimental implicit feedback: evidence and hardware test
 
+This is the original implicit-feedback experiment record. Its always-on-IN
+requirements and temporary rollback paths do not describe the current branch.
+See [STARTUP_RECOVERY.md](STARTUP_RECOVERY.md) for current startup and error policy.
+
 ## Scope
 
 Keep the three ALSA devices: Game Out (0), Voice Out (1), Voice In (2).

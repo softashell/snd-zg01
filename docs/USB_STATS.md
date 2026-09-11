@@ -2,7 +2,7 @@
 
 ## Bounded IN header trace
 
-The next diagnostic build also exposes `/proc/asound/zg01/in_trace`.
+The driver exposes `/proc/asound/zg01/in_trace`.
 It retains at most 256 records: startup packets, non-108-byte packets, errors,
 and the immediate neighbors of length/status transitions. Each record has a
 packet sequence number, callback completion timestamp, actual length, status,
@@ -84,7 +84,8 @@ module reload succeeded. This requires a kernel with `CONFIG_SND_PROC_FS=y`.
 For playback-only reproduction, use the same direct ALSA test as before:
 
 ```bash
-speaker-test -D hw:zg01,1 -c 2 -r 48000 -F S32_LE -t pink
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=60" -ar 48000 -ac 2 -c:a pcm_s32le /tmp/zg01-tone.wav
+aplay -D hw:zg01,1 /tmp/zg01-tone.wav
 ```
 
 In another terminal, save a baseline, then watch counters:
@@ -155,6 +156,17 @@ systemctl --user start pipewire.socket pipewire-pulse.socket pipewire.service pi
 Only nonzero status/length buckets appear. Use snapshot differences for a test
 window; lifetime totals may include previous tests.
 
-Non-108-byte IN packets would prove the fixed-length filter discards traffic.
-They would not, alone, prove the audio framing or feedback protocol. Packet
-captures remain necessary before implementing implicit feedback.
+Valid 92-, 108-, and 124-byte IN packets supply five-, six-, and seven-frame
+plans. Invalid packets do not supply timing. See `STARTUP_RECOVERY.md` for
+current error policy and keepalive behavior.
+
+- `feedback_invalid`: rejected IN packets, including empty packets and packet errors.
+- `feedback_starved`: active-IN fallback attempts plus the fallback-limit fault.
+  Ordinary playback-only free-run does not increment it.
+- `driver_xruns`: the first shared transport fault per OUT fault latch.
+  A fresh drained OUT start clears the latch, not the cumulative counter.
+- `start_epoch`: fresh OUT starts. Warm adoption does not increment it.
+- `first_nonzero_copy_ns` and `first_nonzero_submit_ns`: first nonzero audio
+  events in the current OUT epoch. Read absolute values, not cross-epoch deltas.
+
+Zero aggregate `urb_errors` does not imply zero per-packet USB errors.
