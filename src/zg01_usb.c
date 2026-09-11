@@ -31,12 +31,35 @@ static void zg01_card_private_free(struct snd_card *card)
 }
 
 static int zg01_probe(struct usb_interface *interface,
+                      const struct usb_device_id *id);
+static void zg01_disconnect(struct usb_interface *interface);
+static int zg01_suspend(struct usb_interface *intf, pm_message_t message);
+static int zg01_resume(struct usb_interface *intf);
+static int zg01_reset_resume(struct usb_interface *intf);
+
+static const struct usb_device_id zg01_table[] = {
+    { USB_DEVICE(VENDOR_ID_YAMAHA, PRODUCT_ID_ZG01) },
+    { }
+};
+MODULE_DEVICE_TABLE(usb, zg01_table);
+
+static struct usb_driver zg01_driver = {
+    .name          = "zg01_usb",
+    .id_table      = zg01_table,
+    .probe         = zg01_probe,
+    .disconnect    = zg01_disconnect,
+    .suspend       = zg01_suspend,
+    .resume        = zg01_resume,
+    .reset_resume  = zg01_reset_resume,
+};
+
+static int zg01_probe(struct usb_interface *interface,
                       const struct usb_device_id *id)
 {
     struct usb_device *udev = interface_to_usbdev(interface);
     struct snd_card *card;
     struct zg01_dev *dev;
-    int err;
+    int err, i;
 
     if (interface->cur_altsetting->desc.bInterfaceNumber != 1)
         return 0;
@@ -131,6 +154,26 @@ static int zg01_probe(struct usb_interface *interface,
     }
 
     usb_set_intfdata(interface, dev);
+
+    /* Claim the vendor bulk interfaces (3: EP 0x02/0x82, 4: EP 0x03/0x83)
+     * so snd-usb-audio's useless MIDI devices never take them and the
+     * endpoints stay available (mic-monitor protocol lives here). Claim
+     * fails with -EBUSY when the generic driver already bound at boot;
+     * unbinding 3/4 from snd-usb-audio before loading this module makes
+     * the claim stick. intfdata stays NULL: PCM-less claim. */
+    for (i = 3; i <= 4; i++) {
+        struct usb_interface *aux = usb_ifnum_to_if(udev, i);
+
+        if (!aux)
+            continue;
+        err = usb_driver_claim_interface(&zg01_driver, aux, NULL);
+        if (err && err != -EBUSY)
+            dev_info(&interface->dev,
+                     "interface %d not claimed: %d\n", i, err);
+        else if (!err)
+            dev_info(&interface->dev, "claimed interface %d\n", i);
+    }
+
     dev_info(&interface->dev, "ZG01 card created (3 PCM devices)\n");
     return 0;
 
@@ -148,6 +191,16 @@ static void zg01_disconnect(struct usb_interface *interface)
         return;
 
     usb_set_intfdata(interface, NULL);
+
+    /* Release claimed vendor interfaces (3/4) when the primary
+     * interface disconnects; their own disconnect sees NULL intfdata
+     * and returns above. */
+    for (i = 3; i <= 4; i++) {
+        struct usb_interface *aux = usb_ifnum_to_if(interface_to_usbdev(interface), i);
+
+        if (aux && aux->dev.driver == &zg01_driver.driver)
+            usb_driver_release_interface(&zg01_driver, aux);
+    }
 
     if (atomic_xchg(&dev->disconnected, 1))
         return;
@@ -239,22 +292,6 @@ static int zg01_reset_resume(struct usb_interface *intf)
     usb_set_interface(dev->udev, 2, 0);
     return 0;
 }
-
-static const struct usb_device_id zg01_table[] = {
-    { USB_DEVICE(VENDOR_ID_YAMAHA, PRODUCT_ID_ZG01) },
-    { }
-};
-MODULE_DEVICE_TABLE(usb, zg01_table);
-
-static struct usb_driver zg01_driver = {
-    .name          = "zg01_usb",
-    .id_table      = zg01_table,
-    .probe         = zg01_probe,
-    .disconnect    = zg01_disconnect,
-    .suspend       = zg01_suspend,
-    .resume        = zg01_resume,
-    .reset_resume  = zg01_reset_resume,
-};
 
 static int __init zg01_init(void)
 {
