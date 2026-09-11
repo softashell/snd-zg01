@@ -1515,19 +1515,21 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
             }
         }
         if (even_fill && !priming) {
-            unsigned int total = 0;
+            unsigned int plan_total = 0;
             unsigned int budget = UINT_MAX;
 
             for (i = 0; i < ISO_PKTS_OUT; i++)
-                total += plan.frames[i];
+                plan_total += plan.frames[i];
             for (n = 0; n < 2; n++)
                 if (oc[n].active && limit[n] < budget)
                     budget = limit[n];
             /* The vendor only takes its spread branch when the frame
              * count covers every descriptor; below that it keeps nominal
-             * sizing, so mirror that and never emit zero-length packets. */
+             * sizing, so mirror that and never emit zero-length packets.
+             * Size from the taken plan, not the outer total: with
+             * ignore_plans the flatten above changes what is owed. */
             if (budget != UINT_MAX && budget >= ISO_PKTS_OUT &&
-                budget < total) {
+                budget < plan_total) {
                 unsigned int base = budget / ISO_PKTS_OUT;
                 unsigned int rem = budget % ISO_PKTS_OUT;
 
@@ -1535,7 +1537,7 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                     plan.frames[i] = base + (i < rem ? 1 : 0);
                 c->stats.even_fill_urbs++;
                 c->stats.even_fill_last_budget = budget;
-                c->stats.even_fill_deficit += total - budget;
+                c->stats.even_fill_deficit += plan_total - budget;
             }
         }
         urb = c->urbs[id];
