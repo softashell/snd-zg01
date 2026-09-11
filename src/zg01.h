@@ -228,6 +228,7 @@ struct zg01_dev {
     bool device_initialized;                  /* vendor handshake + rate */
     bool suspended;                           /* state_mutex: block restarts during PM */
     bool keepalive_rearm;                     /* dev->lock: fault recovery pending */
+    bool free_run_holdback;                   /* dev->lock: OUT free-runs past IN storm */
     struct delayed_work keepalive_rearm_work; /* fault re-arm after backoff */
 
     atomic_t disconnecting;                   /* URB resubmission off */

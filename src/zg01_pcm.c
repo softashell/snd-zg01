@@ -571,6 +571,7 @@ retry:
         dev->have_last_plan = false;
         dev->feedback_started = false;
         dev->feedback_fault = false;
+        dev->free_run_holdback = false;
         dev->feedback_gap_urbs = 0;
         dev->feedback_startup_urbs = 0;
         memset(c->completed_frames, 0, sizeof(c->completed_frames));
@@ -1331,9 +1332,23 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                 if (grace)
                     gap_limit = max(gap_limit, DIV_ROUND_UP(grace, 4U));
                 if (!free_run && dev->feedback_gap_urbs >= gap_limit) {
-                    dev->out_chain.stats.feedback_starved++;
-                    zg01_feedback_xrun(dev);
-                    return;
+                    if (grace && dev->streams[ZG01_VOICE_IN].enabled) {
+                        /* Storm under real capture: free-run OUT on
+                         * nominal cadence instead of faulting it.
+                         * Log once per holdback; a valid plan lifts
+                         * it and restores feedback pacing. */
+                        if (!dev->free_run_holdback) {
+                            dev->free_run_holdback = true;
+                            dev->have_last_plan = false;
+                            dev_info(&dev->udev->dev,
+                                     "IN storm under capture: OUT free-running\n");
+                        }
+                        dev->feedback_gap_urbs = 0;
+                    } else {
+                        dev->out_chain.stats.feedback_starved++;
+                        zg01_feedback_xrun(dev);
+                        return;
+                    }
                 }
             }
         } else {
@@ -1623,6 +1638,13 @@ static void zg01_iso_in(struct urb *urb)
 
                 if (transient && grace)
                     limit = DIV_ROUND_UP(grace, 4U);
+                /* Real capture owns a storming IN endpoint: transient
+                 * packet errors must not execute the shared OUT
+                 * transport at all. The pump free-runs on nominal
+                 * cadence until valid plans return. */
+                if (transient && grace &&
+                    dev->streams[ZG01_VOICE_IN].enabled)
+                    limit = UINT_MAX;
                 if (++dev->feedback_startup_urbs >= limit)
                     zg01_feedback_xrun_all(dev);
             }
@@ -1635,6 +1657,7 @@ static void zg01_iso_in(struct urb *urb)
              * invalid URBs at once; the optional grace tolerates only
              * bounded transient errors. The pump never uses bad plans. */
             dev->feedback_started = true;
+            dev->free_run_holdback = false;
             if (dev->prime_deadline_ns && !dev->prime_in_first_ns)
                 dev->prime_in_first_ns = ktime_get_ns();
             if (!zg01_feedback_push(&dev->feedback, &plan)) {
