@@ -1057,14 +1057,9 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         } else if (!zg01_feedback_take(q, &plan, &id)) {
             return;
         }
-        /* Linux trials associated variable OUT sizes with clicks, so
-         * this workaround uses fixed six-frame packets. Windows ETW
-         * instead shows occasional larger OUT transfers consistent with
-         * seven-frame inserts (../captures/zg01-cycle-transfers.tsv).
-         * ETW sizes do not prove clicks or a device drift-absorption
-         * mechanism. Consume IN plans for liveness, not OUT sizing. */
-        for (i = 0; i < ISO_PKTS_OUT; i++)
-            plan.frames[i] = 6;
+        /* Follow each validated IN plan. Windows captures show occasional
+         * seven-frame inserts. This restores measured clock compensation
+         * for an A/B test against the fixed six-frame workaround. */
         urb = c->urbs[id];
         memset(urb->transfer_buffer, 0, c->iso_pkts * c->iso_pkt_size);
         used[0] = used[1] = 0;
