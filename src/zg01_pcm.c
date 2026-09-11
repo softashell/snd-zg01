@@ -949,11 +949,10 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
             dev->feedback_started = true;
         dev->have_last_plan = true;
     }
-    if (!dev->feedback_started) {
-        if (q->plans < 2)
-            return;
-        dev->feedback_started = true;
-    }
+    /* feedback_started latches on the first valid IN plan (see the
+     * push path in zg01_iso_in), not here: invalid IN URBs before
+     * any valid plan must keep the bounded startup tolerance below
+     * instead of faulting at once. */
     while (!atomic_read(&dev->disconnecting) && zg01_chain_active(c) &&
            atomic_read(&c->inflight) < 2) {
         bool gap_fallback = false;
@@ -1038,9 +1037,10 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
          * endpoint reports its framing honestly (5-7 frames/packet,
          * ~+21ppm clock drift producing isolated 7-frame packets every
          * ~1s), but the output side clicks audibly whenever an
-         * odd-sized packet lands. Windows never varies the packet size:
-         * constant 240-byte packets, drift absorbed by the device.
-         * Mirror that: send the nominal 6 frames per packet regardless
+         * odd-sized packet lands. Windows captures show the same:
+         * 280 B seven-frame inserts at ~1.13/s (~23 ppm) on an
+         * otherwise steady 240 B stream. Absorb drift device-side
+         * instead: send the nominal 6 frames per packet regardless
          * of the measured plan. The plan is still taken (and counted)
          * so feedback stats and gap-fallback liveness stay intact; only
          * the sizing is ignored. */
@@ -1254,6 +1254,10 @@ static void zg01_iso_in(struct urb *urb)
             (dev->feedback.pending || atomic_read(&dev->out_chain.inflight))) {
             dev->last_plan = plan;
             dev->have_last_plan = true;
+            /* First valid plan ends startup: later invalid IN URBs
+             * fault at once, and the gap-fallback branch below can
+             * run on this plan. */
+            dev->feedback_started = true;
             if (dev->prime_deadline_ns && !dev->prime_in_first_ns)
                 dev->prime_in_first_ns = ktime_get_ns();
             if (!zg01_feedback_push(&dev->feedback, &plan)) {
