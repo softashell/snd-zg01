@@ -629,6 +629,9 @@ int zg01_set_rate(struct zg01_dev *dev, int rate)
     unsigned char *data;
     unsigned char *large_data;
     int ret = 0;
+    int fatal = 0;
+    const char *fatal_stage = NULL;
+    const char *stage = "allocation";
 
     if (!dev || !dev->udev)
         return -ENODEV;
@@ -643,26 +646,59 @@ int zg01_set_rate(struct zg01_dev *dev, int rate)
 
     dev_dbg(&dev->udev->dev, "set_rate %d\n", rate);
 
-    /* 1. Early vendor reads (state discovery / standby exit) */
-    usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+    /* The firmware STALLs vendor EP0 reads unpredictably (three
+     * different requests across two sessions, usbmon verified) and
+     * aborted sequences make it worse: leaving the handshake half-done
+     * (interfaces at alt 0, commit writes unsent) makes the next
+     * attempt stall more. So send the COMPLETE legacy sequence every
+     * time, never abort mid-sequence, log advisory results, restore
+     * alt 1 unconditionally, and report the first load-bearing failure
+     * (interface change or clock) at the end. Vendor read payloads are
+     * unused downstream; the legacy driver ignored all return codes. */
+    stage = "vendor 0x07";
+    ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
                     0x07, USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
                     0x0000, 0x0000, large_data, 3, 1000);
-    usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+    if (ret != 3)
+        dev_warn_ratelimited(&dev->udev->dev, "vendor read 0x07: %d (continuing)\n", ret);
+    stage = "vendor 0x04";
+    ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
                     0x04, USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
                     0x0000, 0x0000, large_data, 1, 1000);
-    usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+    if (ret != 1)
+        dev_warn_ratelimited(&dev->udev->dev, "vendor read 0x04: %d (continuing)\n", ret);
+    stage = "vendor 0x0a";
+    ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
                     0x0a, USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
                     0x0000, 0x0000, large_data, 4, 1000);
-    usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+    if (ret != 4)
+        dev_warn_ratelimited(&dev->udev->dev, "vendor read 0x0a: %d (continuing)\n", ret);
+    stage = "vendor 0x0c/0x8000";
+    ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
                     0x0c, USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
                     0x8000, 0x0000, large_data, 72, 1000);
-    usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+    if (ret != 72)
+        dev_warn_ratelimited(&dev->udev->dev, "vendor read 0x0c/0x8000: %d (continuing)\n", ret);
+    stage = "vendor 0x0c/0x0000";
+    ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
                     0x0c, USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
                     0x0000, 0x0000, large_data, 72, 1000);
+    if (ret != 72)
+        dev_warn_ratelimited(&dev->udev->dev, "vendor read 0x0c/0x0000: %d (continuing)\n", ret);
 
     /* 2. Interfaces to alt 0 */
-    usb_set_interface(dev->udev, 1, 0);
-    usb_set_interface(dev->udev, 2, 0);
+    stage = "interface 1 alt 0";
+    ret = usb_set_interface(dev->udev, 1, 0);
+    if (ret < 0 && !fatal) {
+        fatal = ret;
+        fatal_stage = stage;
+    }
+    stage = "interface 2 alt 0";
+    ret = usb_set_interface(dev->udev, 2, 0);
+    if (ret < 0 && !fatal) {
+        fatal = ret;
+        fatal_stage = stage;
+    }
 
     /* 3. UAC2 SET_CUR on clock source 1, verify with GET_CUR */
     data[0] = rate & 0xff;
@@ -673,13 +709,15 @@ int zg01_set_rate(struct zg01_dev *dev, int rate)
         int attempt;
 
         for (attempt = 1; attempt <= 3; attempt++) {
+            stage = "clock SET_CUR";
             ret = usb_control_msg(dev->udev, usb_sndctrlpipe(dev->udev, 0),
                                   0x01, USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
                                   0x0100, 0x0100, data, 4, 1000);
-            if (ret < 0)
-                dev_warn(&dev->udev->dev, "set_rate attempt %d SET_CUR: %d\n",
-                         attempt, ret);
-
+            if (ret != 4) {
+                ret = ret < 0 ? ret : -EIO;
+                goto retry_rate;
+            }
+            stage = "clock GET_CUR";
             ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
                                   0x01, USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
                                   0x0100, 0x0100, large_data, 4, 1000);
@@ -689,39 +727,74 @@ int zg01_set_rate(struct zg01_dev *dev, int rate)
                                         ((u32)large_data[2] << 16) |
                                         ((u32)large_data[3] << 24);
 
-                ret = 0;
-                if ((int)ret_rate != rate)
-                    dev_warn(&dev->udev->dev,
-                             "device reported rate %u (asked %d), using device rate\n",
-                             ret_rate, rate);
-                break;
+                /* Every PCM advertises 48 kHz. A different device rate
+                 * cannot satisfy that contract without conversion. */
+                ret = ret_rate == (unsigned int)rate ? 0 : -ERANGE;
+                if (!ret)
+                    break;
+            } else {
+                ret = ret < 0 ? ret : -EIO;
             }
-            ret = (ret < 0) ? ret : -EIO;
+retry_rate:
             if (attempt < 3)
                 msleep(150);
         }
+        if (ret && !fatal) {
+            fatal = ret;
+            fatal_stage = stage;
+        }
     }
 
-    /* 4. Commit handshake */
-    usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+    /* 4. Commit handshake. Payloads are unused and these stall like
+     * the discovery reads; log-and-continue so the device still sees
+     * the complete sequence. */
+    stage = "vendor 0x02/0x0002";
+    ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
                     0x02, USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
                     0x0002, 0x0000, large_data, 1, 1000);
-    usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+    if (ret != 1)
+        dev_warn_ratelimited(&dev->udev->dev, "vendor read 0x02/0x0002: %d (continuing)\n", ret);
+    stage = "vendor 0x02/0x0001";
+    ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
                     0x02, USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
                     0x0001, 0x0000, large_data, 1, 1000);
-    usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
+    if (ret != 1)
+        dev_warn_ratelimited(&dev->udev->dev, "vendor read 0x02/0x0001: %d (continuing)\n", ret);
+    stage = "vendor 0x08";
+    ret = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
                     0x08, USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
                     0x0000, 0x0000, large_data, 1, 1000);
-    usb_control_msg(dev->udev, usb_sndctrlpipe(dev->udev, 0),
+    if (ret != 1)
+        dev_warn_ratelimited(&dev->udev->dev, "vendor read 0x08: %d (continuing)\n", ret);
+    stage = "vendor 0x00";
+    ret = usb_control_msg(dev->udev, usb_sndctrlpipe(dev->udev, 0),
                     0x00, USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
                     0x0000, 0x0000, NULL, 0, 1000);
+    if (ret != 0)
+        dev_warn_ratelimited(&dev->udev->dev, "vendor write 0x00: %d (continuing)\n", ret);
 
-    /* 5. Streaming interfaces back to alt 1 */
-    usb_set_interface(dev->udev, 1, 1);
-    usb_set_interface(dev->udev, 2, 1);
+    /* 5. Streaming interfaces back to alt 1 — unconditional, even
+     * after an earlier fatal step, so a failed attempt leaves the
+     * device in the streaming configuration for the next try. */
+    stage = "interface 1 alt 1";
+    ret = usb_set_interface(dev->udev, 1, 1);
+    if (ret < 0 && !fatal) {
+        fatal = ret;
+        fatal_stage = stage;
+    }
+    stage = "interface 2 alt 1";
+    ret = usb_set_interface(dev->udev, 2, 1);
+    if (ret < 0 && !fatal) {
+        fatal = ret;
+        fatal_stage = stage;
+    }
 
     msleep(200);
 
+    ret = fatal;
+    if (ret < 0)
+        dev_warn_ratelimited(&dev->udev->dev, "initialization failed at %s: %d\n",
+                             fatal_stage ? fatal_stage : "allocation", ret);
     kfree(large_data);
     kfree(data);
     return ret;
