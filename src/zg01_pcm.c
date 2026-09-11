@@ -63,12 +63,13 @@ static unsigned int assist_ms;
 module_param(assist_ms, uint, 0644);
 MODULE_PARM_DESC(assist_ms, "Experimental simultaneous IN assist per fresh playback start in ms (0=off, default 0)");
 
-/* Trial-only tolerance for transient IN packet errors. Keep strict
- * behavior by default until hardware A/B confirms this recovery policy.
- * Bound the grace to the existing 500 ms OUT fallback budget. */
-static unsigned int in_error_grace_ms;
+/* Tolerance for transient IN packet errors. Hardware A/B confirmed this
+ * recovery policy: strict mode faulted the shared OUT transport when the
+ * device emitted a -EPROTO storm under real capture, while a bounded grace
+ * absorbed it. Bound the grace to the existing 500 ms OUT fallback budget. */
+static unsigned int in_error_grace_ms = 100;
 module_param(in_error_grace_ms, uint, 0644);
-MODULE_PARM_DESC(in_error_grace_ms, "Transient IN error grace in ms, capped at 500 (0=strict, default 0)");
+MODULE_PARM_DESC(in_error_grace_ms, "Transient IN error grace in ms, capped at 500 (0=strict, default 100)");
 
 /* Trial-only A/B.  Hardware measurement: the device asks for nominal six
  * frames in 99.987 percent of IN packets and inserts one extra frame every

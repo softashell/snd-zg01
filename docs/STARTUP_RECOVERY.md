@@ -83,10 +83,12 @@ refuse it. Enabled streams suppress the re-arm; their own recovery paths own
 the next start. Suspend and disconnect clear the pending flag and cancel the
 work item.
 
-## Transient IN error experiment
+## Transient IN error grace
 
-`in_error_grace_ms` defaults to 0, which retains strict feedback error handling.
-A nonzero value permits a bounded sequence of transient invalid IN URBs.
+`in_error_grace_ms` defaults to 100 ms, which permits a bounded sequence of
+transient invalid IN URBs. Hardware A/B confirmed this policy: strict mode
+faulted the shared OUT transport when the device emitted a `-EPROTO` storm
+under real capture, while the grace absorbed it. Set 0 for strict handling.
 The implementation rounds to 4 ms URBs and caps the setting at 500 ms.
 A valid full IN plan resets the consecutive-error count.
 
@@ -106,15 +108,16 @@ pacing. The exemption is scoped to intentional IN: a capture-only rule turned
 the IN-only re-arm into a two-second fault loop, because each re-armed
 keepalive IN stormed and executed OUT through the IN-side limit.
 
-For a hardware A/B, start with 0 versus 100 while keeping all other parameters,
-clients, PCM buffer sizes, and test audio unchanged:
+For a hardware A/B, compare 0 versus 100 while keeping all other parameters,
+clients, PCM buffer sizes, and test audio unchanged. The default is 100, so the
+runtime switch tests strict mode:
 
 ```bash
-printf '100\n' | sudo tee /sys/module/snd_zg01/parameters/in_error_grace_ms
+printf '0\n' | sudo tee /sys/module/snd_zg01/parameters/in_error_grace_ms
 cat /sys/module/snd_zg01/parameters/in_error_grace_ms
 ```
 
-Return to strict mode by writing 0. The user performs privileged changes.
+The user performs privileged changes.
 Do not call the grace a fix for the underlying USB protocol error.
 
 ## OUT packet sizing and starvation

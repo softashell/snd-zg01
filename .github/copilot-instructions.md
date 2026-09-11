@@ -96,8 +96,8 @@ Suspend stops both chains and forces re-init on the next prepare;
   URBs; prepare requires both chains STOPPED before running it.
 - USB control buffers must be heap allocated, never on stack.
 - IN errors have bounded startup tolerance. After valid feedback begins,
-  strict mode faults invalid IN immediately. `in_error_grace_ms` (default 0,
-  cap 500) can tolerate transient packet errors, never malformed timing plans.
+  strict mode faults invalid IN immediately. `in_error_grace_ms` (default 100,
+  cap 500) tolerates transient packet errors, never malformed timing plans.
   Terminal resubmit statuses still drain. See `docs/STARTUP_RECOVERY.md`.
 - Do not count free-run completions as feedback starvation. Count a transport
   fault once per OUT fault latch, but preserve notifications to real capture.
