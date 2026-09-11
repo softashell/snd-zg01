@@ -1320,12 +1320,21 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
             /* Bound fallback to ~500 ms without a fresh valid plan,
              * then fault playback instead of repeating stale timing.
              * EXPERIMENT: no IN chain means no plans can ever arrive;
-             * the bound does not apply. */
-            if (!free_run &&
-                dev->feedback_gap_urbs >= ZG01_GAP_FALLBACK_MAX_URBS) {
-                dev->out_chain.stats.feedback_starved++;
-                zg01_feedback_xrun(dev);
-                return;
+             * the bound does not apply. While the IN error grace is
+             * active, hold the same grace budget here: a storming IN
+             * endpoint under real capture must not execute the shared
+             * OUT transport every 500 ms while its packets recover. */
+            {
+                unsigned int gap_limit = ZG01_GAP_FALLBACK_MAX_URBS;
+                unsigned int grace = min(READ_ONCE(in_error_grace_ms), 500U);
+
+                if (grace)
+                    gap_limit = max(gap_limit, DIV_ROUND_UP(grace, 4U));
+                if (!free_run && dev->feedback_gap_urbs >= gap_limit) {
+                    dev->out_chain.stats.feedback_starved++;
+                    zg01_feedback_xrun(dev);
+                    return;
+                }
             }
         } else {
             break;
