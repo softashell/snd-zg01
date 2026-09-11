@@ -48,30 +48,27 @@ static unsigned int vendor_start_req;
 module_param(vendor_start_req, uint, 0644);
 MODULE_PARM_DESC(vendor_start_req, "Send Windows start vendor request 0x0b/0x0060 per fresh OUT start (0=off, default 0)");
 
-/* Full Windows start triple: the vendor request above followed by
- * SET_INTERFACE alt 1 on interfaces 1 and 2 (usbmon frames 16203,
- * 16211, 16219). Windows resets the endpoints at EVERY start and
- * hears no discard; the bare request without the reset correlated
- * with discards in hardware trials. The interface reset is forced
- * even when alt 1 is already current — that reset is the point.
- * Interface 2 is only reset when its chain is stopped, so live
- * capture is never killed. */
+/* Full Windows start triple from usbmon frames 16203, 16211, 16219.
+ * Hardware A/B did not prevent startup discard with either replay.
+ * Retain this disabled experiment as negative evidence. Interface 2
+ * is only reset when stopped, so a replay does not reset live capture. */
 static unsigned int vendor_start_seq;
 module_param(vendor_start_seq, uint, 0644);
 MODULE_PARM_DESC(vendor_start_seq, "Full Windows start per fresh OUT start: vendor request + forced SET_INTERFACE alt 1 on both streaming interfaces (0=off, default 0)");
 
-/* Liveness assist: hardware trials (2026-09-08) showed the device
- * discards the first seconds of a fresh OUT stream whenever its IN
- * pipe was idle, and passes audio from the first frame when IN is
- * active around the start — with cold transport, no priming, no EP0
- * requests. The device gates its output path on combined IN+OUT
- * traffic. This runs IN for assist_ms on every fresh playback epoch
- * (via in_assist), long enough to cover the discard window, then
- * drains IN. Playback-only is IN-free again for the rest of the
- * stream, keeping the firmware IN-restart pops out. */
+/* Timed simultaneous IN assist did not prevent startup discard in
+ * hardware trials. Established IN before playback did help. Retain
+ * this disabled experiment for A/B, not as a readiness guarantee. */
 static unsigned int assist_ms;
 module_param(assist_ms, uint, 0644);
-MODULE_PARM_DESC(assist_ms, "Run IN for N ms at every fresh playback start so the device keeps its output path live (0=off, default 0)");
+MODULE_PARM_DESC(assist_ms, "Experimental simultaneous IN assist per fresh playback start in ms (0=off, default 0)");
+
+/* Trial-only tolerance for transient IN packet errors. Keep strict
+ * behavior by default until hardware A/B confirms this recovery policy.
+ * Bound the grace to the existing 500 ms OUT fallback budget. */
+static unsigned int in_error_grace_ms;
+module_param(in_error_grace_ms, uint, 0644);
+MODULE_PARM_DESC(in_error_grace_ms, "Transient IN error grace in ms, capped at 500 (0=strict, default 0)");
 
 #define PCM_BUFFER_BYTES_MAX_GAME   (1536 * 32)
 #define PCM_BUFFER_BYTES_MIN_GAME   (1536 * 2)
@@ -1456,6 +1453,7 @@ static void zg01_iso_in(struct urb *urb)
     unsigned long flags;
     unsigned int old_pos, i, f;
     bool valid = urb->status == 0 && urb->number_of_packets == ISO_PKTS_IN;
+    bool transient = valid;
 
     spin_lock_irqsave(&dev->lock, flags);
     zg01_usb_stats_account(&c->stats, urb, true, ktime_get_ns());
@@ -1476,6 +1474,14 @@ static void zg01_iso_in(struct urb *urb)
             if (!frames) {
                 c->stats.feedback_invalid++;
                 valid = false;
+                /* Empty successful packets and USB scheduling/protocol
+                 * errors may recover. Malformed nonempty packets must
+                 * never become a timing plan or use the grace window. */
+                if ((!p->status && p->actual_length) ||
+                    (p->status && p->status != -EPROTO &&
+                     p->status != -EILSEQ && p->status != -ETIME &&
+                     p->status != -EXDEV))
+                    transient = false;
                 continue;
             }
             c->stats.feedback_valid++;
@@ -1495,17 +1501,25 @@ static void zg01_iso_in(struct urb *urb)
         if (zg01_chain_active(&dev->out_chain) &&
             (dev->feedback.pending || atomic_read(&dev->out_chain.inflight)) &&
             !dev->feedback_fault) {
-            if (!valid && (dev->feedback_started ||
-                          ++dev->feedback_startup_urbs >= MAX_URBS))
-                zg01_feedback_xrun_all(dev);
+            if (valid) {
+                dev->feedback_startup_urbs = 0;
+            } else {
+                unsigned int limit = dev->feedback_started ? 1 : MAX_URBS;
+                unsigned int grace = min(READ_ONCE(in_error_grace_ms), 500U);
+
+                if (transient && grace)
+                    limit = DIV_ROUND_UP(grace, 4U);
+                if (++dev->feedback_startup_urbs >= limit)
+                    zg01_feedback_xrun_all(dev);
+            }
         }
         if (valid && !dev->feedback_fault && zg01_chain_active(&dev->out_chain) &&
             (dev->feedback.pending || atomic_read(&dev->out_chain.inflight))) {
             dev->last_plan = plan;
             dev->have_last_plan = true;
-            /* First valid plan ends startup: later invalid IN URBs
-             * fault at once, and the gap-fallback branch below can
-             * run on this plan. */
+            /* First valid plan ends startup. Strict mode faults later
+             * invalid URBs at once; the optional grace tolerates only
+             * bounded transient errors. The pump never uses bad plans. */
             dev->feedback_started = true;
             if (dev->prime_deadline_ns && !dev->prime_in_first_ns)
                 dev->prime_in_first_ns = ktime_get_ns();
