@@ -70,6 +70,27 @@ static unsigned int in_error_grace_ms;
 module_param(in_error_grace_ms, uint, 0644);
 MODULE_PARM_DESC(in_error_grace_ms, "Transient IN error grace in ms, capped at 500 (0=strict, default 0)");
 
+/* Trial-only A/B.  Hardware measurement: the device asks for nominal six
+ * frames in 99.987 percent of IN packets and inserts one extra frame every
+ * ~0.97 s, a ~21.5 ppm offset between its audio clock and the host 125 us
+ * microframe clock.  This flattens every OUT plan to six frames while IN
+ * keeps streaming real feedback, so a trial shows whether the device
+ * absorbs that offset from its own buffer or drops audio.  Deviations
+ * dropped are counted in plan_frames_ignored.  Disabled by default. */
+static unsigned int ignore_plans;
+module_param(ignore_plans, uint, 0644);
+MODULE_PARM_DESC(ignore_plans, "Send nominal six frames per OUT packet and ignore IN plan sizing (0=follow plans, default 0)");
+
+/* Trial-only A/B. A live capture session showed the driver zero-padding
+ * 64 frames, 1-2 times a second, whenever an active ring held fewer
+ * frames than one 4 ms URB needs. The audio is delayed rather than lost,
+ * but a jump to zero and back is a click. This repeats the last frame of
+ * that consumer instead, which keeps the waveform continuous. 0 keeps
+ * the current zero padding. */
+static unsigned int short_hold;
+module_param(short_hold, uint, 0644);
+MODULE_PARM_DESC(short_hold, "Repeat the last frame instead of zero padding when an active ring runs short (0=zeros, default 0)");
+
 #define PCM_BUFFER_BYTES_MAX_GAME   (1536 * 32)
 #define PCM_BUFFER_BYTES_MIN_GAME   (1536 * 2)
 /*
@@ -1089,9 +1110,24 @@ static void zg01_usb_stats_print(struct snd_info_buffer *buffer,
                 snd_iprintf(buffer, "in_length %d %llu\n", i, s->in_length[i]);
         snd_iprintf(buffer, "in_length_overflow %llu\n", s->in_length_overflow);
     } else {
-        snd_iprintf(buffer, "out_length_mismatch %llu\n", s->out_length_mismatch);
+        snd_iprintf(buffer, "out_length_mismatch %llu\nplan_frames_ignored %llu\n",
+                    s->out_length_mismatch, s->plan_frames_ignored);
         for (i = 5; i <= 7; i++)
             snd_iprintf(buffer, "out_frames %d %llu\n", i, s->out_frames[i]);
+        for (i = 0; i < 2; i++) {
+            if (!s->out_short_frames[i])
+                continue;
+            snd_iprintf(buffer, "out_short_frames %u %llu\n", i,
+                        s->out_short_frames[i]);
+            snd_iprintf(buffer, "out_short_events %u %llu\n", i,
+                        s->out_short_events[i]);
+            snd_iprintf(buffer,
+                        "out_short_last %u avail %llu used %llu frames %llu index %llu\n",
+                        i, s->out_short_last_avail[i],
+                        s->out_short_last_used[i],
+                        s->out_short_last_frames[i],
+                        s->out_short_last_index[i]);
+        }
     }
 }
 
@@ -1320,6 +1356,9 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         bool gap_fallback = false;
         bool defer = false;
         bool free_run = !zg01_chain_active(&dev->in_chain);
+        bool short_event[2] = { false, false };
+        u8 hold_frame[2][8] = { { 0 }, { 0 } };
+        bool have_hold_frame[2] = { false, false };
 
         nonzero_urb = false;
 
@@ -1439,6 +1478,14 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         /* Follow each validated IN plan. Windows captures show occasional
          * seven-frame inserts. This restores measured clock compensation
          * for an A/B test against the fixed six-frame workaround. */
+        if (ignore_plans) {
+            for (i = 0; i < ISO_PKTS_OUT; i++) {
+                if (plan.frames[i] != 6) {
+                    plan.frames[i] = 6;
+                    c->stats.plan_frames_ignored++;
+                }
+            }
+        }
         urb = c->urbs[id];
         memset(urb->transfer_buffer, 0, c->iso_pkts * c->iso_pkt_size);
         used[0] = used[1] = 0;
@@ -1496,12 +1543,34 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                     unsigned int off;
                     struct zg01_stream *s = oc[n].s;
 
-                    if (!oc[n].active || used[n] >= limit[n])
+                    if (!oc[n].active)
                         continue;
+                    if (used[n] >= limit[n]) {
+                        /* Active ring ran out inside this packet and the
+                         * remaining frames go out as silence. One hole in
+                         * a packet is an audible tick, so count it and keep
+                         * the shape of the first one per packet. */
+                        if (!short_event[n]) {
+                            short_event[n] = true;
+                            c->stats.out_short_events[n]++;
+                            c->stats.out_short_last_avail[n] = oc[n].available;
+                            c->stats.out_short_last_used[n] = used[n];
+                            c->stats.out_short_last_frames[n] = plan.frames[i];
+                            c->stats.out_short_last_index[n] = i;
+                        }
+                        c->stats.out_short_frames[n]++;
+                        if (short_hold && !priming && have_hold_frame[n])
+                            memcpy(pkt + f * 40 + (n == 0 ? 8 : 0),
+                                   hold_frame[n], 8);
+                        continue;
+                    }
                     off = ((s->queued_pos + used[n]) % oc[n].rt->buffer_size) * 8;
                     if (!priming) {
                         memcpy(pkt + f * 40 + (n == 0 ? 8 : 0),
                                oc[n].rt->dma_area + off, 8);
+                        memcpy(hold_frame[n],
+                               pkt + f * 40 + (n == 0 ? 8 : 0), 8);
+                        have_hold_frame[n] = true;
                         for (j = 0; j < 8; j++) {
                             if (oc[n].rt->dma_area[off + j]) {
                                 nonzero_urb = true;

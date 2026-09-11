@@ -112,6 +112,14 @@ struct zg01_usb_stats {
     u64 in_length_overflow;
     u64 out_length_mismatch;
     u64 out_frames[8];                       /* successful complete packets */
+    u64 out_short_frames[2];                 /* per consumer: frames an active
+                                              * ring could not supply, sent as
+                                              * silence inside a packet */
+    u64 out_short_events[2];                 /* packets carrying a shortfall */
+    u64 out_short_last_avail[2];             /* shape of the last shortfall */
+    u64 out_short_last_used[2];
+    u64 out_short_last_frames[2];
+    u64 out_short_last_index[2];
     u64 first_nonzero_copy_ns;
     u64 first_nonzero_copy_frame;
     u64 first_nonzero_submit_ns;
@@ -123,6 +131,7 @@ struct zg01_usb_stats {
     u64 feedback_starved;
     u64 feedback_overflow;
     u64 feedback_submit_errors;
+    u64 plan_frames_ignored;                /* OUT deviations dropped by ignore_plans */
     u64 playback_waits;
     u64 playback_defer;                     /* delivered refill waits */
     u64 silence_frames;                     /* padded for a running stream */
