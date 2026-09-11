@@ -97,9 +97,15 @@ MODULE_PARM_DESC(short_hold, "Repeat the last frame instead of zero padding when
  * prefix) and carries the deficit into the next URB. Our driver instead
  * zero-fills the tail, which was measured as 64 frames of silence 1-2
  * times a second. This applies the vendor spread. 0 keeps the tail fill. */
-static unsigned int even_fill;
+static unsigned int even_fill = 1;
 module_param(even_fill, uint, 0644);
-MODULE_PARM_DESC(even_fill, "Spread available frames across all packets when the plan cannot be covered (0=tail fill, default 0)");
+MODULE_PARM_DESC(even_fill, "Spread available frames across all packets when the plan cannot be covered (0=tail fill, default 1)");
+
+/* The tail-fill policy this replaces put exactly 64 frames of silence into
+ * a consumer's slot 1-2 times a second, because one URB needs 192 frames
+ * per consumer and a 128-frame budget leaves the difference. Measured on
+ * hardware: 896 hole frames over 14 events in 15 s with the spread off,
+ * zero with it on. */
 
 #define PCM_BUFFER_BYTES_MAX_GAME   (1536 * 32)
 #define PCM_BUFFER_BYTES_MIN_GAME   (1536 * 2)

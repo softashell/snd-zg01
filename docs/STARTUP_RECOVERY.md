@@ -117,6 +117,35 @@ cat /sys/module/snd_zg01/parameters/in_error_grace_ms
 Return to strict mode by writing 0. The user performs privileged changes.
 Do not call the grace a fix for the underlying USB protocol error.
 
+## OUT packet sizing and starvation
+
+The pump takes one consumer-availability snapshot per URB and fills all 32
+packets from it, so one URB needs 192 frames per playback consumer at
+nominal six-frame sizing.
+
+`ignore_plans` (0644, default 0) flattens every packet to six frames and
+counts the discarded deviations in `plan_frames_ignored`. It applies
+BEFORE the spread below, because flattening a spread URB back to nominal
+reintroduces the tail hole. Measured: 14 events of 64 frames in 15 s with
+the order reversed.
+
+`even_fill` (0644, default 1) mirrors the vendor builder. When an active
+ring holds fewer frames than the plan needs, it spreads that budget over
+all 32 packets (budget/32 frames each, plus one on a prefix) and carries
+the deficit into the next URB. It applies only when the budget covers
+every descriptor, which is the vendor's own condition. Vendor source:
+`ysusb_w10_64.sys` FUN_140017efc.
+
+`short_hold` (0644, default 0) repeats the last frame instead of writing
+zeros on a shortfall. It changes the content of a hole, never its count,
+and hardware trials did not remove the audible artifact it targeted.
+Retained as negative evidence.
+
+Read `out_short_frames`, `out_short_events`, `out_short_last`,
+`even_fill_urbs` and `even_fill_last_budget` in the OUT block. A healthy
+session keeps `out_short_frames` flat while `even_fill_urbs` climbs about
+1-2 per second.
+
 ## Diagnostics and acceptance
 
 Read `/proc/asound/zg01/usb_stats` before and after each trial.
