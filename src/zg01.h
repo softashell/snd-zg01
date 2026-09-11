@@ -196,7 +196,6 @@ struct zg01_dev {
     u64 prime_ready_ns;                      /* dev->lock: release timestamp */
     u64 prime_released_frame;                /* dev->lock: game queued_pos at release */
     u64 prime_in_first_ns;                   /* dev->lock: first valid IN plan of epoch */
-    u64 prime_epoch;                         /* dev->lock: start_epoch the deadline belongs to */
     bool in_assist;                          /* dev->lock: IN runs only for prime readiness */
     bool out_silence;                        /* dev->lock: OUT runs with no playback (capture-owned) */
 

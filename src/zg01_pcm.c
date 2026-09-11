@@ -27,15 +27,13 @@
 
 #include "zg01.h"
 
-/* The ZG01 intermittently discards the first fraction-of-a-second of a
- * freshly started OUT stream (measured 0.4-1.5 s windows; host transport
- * is clean in failing trials). Prime the device with silence on every
- * fresh OUT start: consume and DROP the application's frames during the
- * priming window. ALSA's clock keeps advancing (hw_ptr follows retired
- * frames), so no EIO. prime_ms is a safety cap: the pump releases early
- * on device readiness when an IN signal exists. 0 disables priming.
- * Disabled by default: playback-only mode has no IN signal, so the cap
- * always governed and desktop cold starts ate the full window. */
+/* Startup trials lost early audio despite clean host transport. This
+ * optional experiment consumes and DROPS application frames during a
+ * silence window while ALSA's clock advances. prime_ms caps the window;
+ * valid IN traffic plus a settle delay can release it early. Playback-only
+ * starts use a brief IN assist for that transport heuristic, which does
+ * not establish audible device readiness. Disabled by default because
+ * priming drops application audio; 0 disables priming on fresh starts. */
 static unsigned int prime_ms;
 module_param(prime_ms, uint, 0644);
 MODULE_PARM_DESC(prime_ms, "Silence-priming cap in ms per fresh OUT start (0=off, default 0)");
@@ -394,7 +392,10 @@ retry:
             (dev->streams[ZG01_GAME].running ||
              dev->streams[ZG01_VOICE_OUT].running)) ?
             ktime_get_ns() + (u64)prime_ms * NSEC_PER_MSEC : 0;
-        c->dev->prime_epoch = c->stats.start_epoch;
+        /* Only this drained, fresh OUT initialization may arm assist.
+         * RUNNING adoption returns above and preserves the current epoch. */
+        dev->in_assist = dev->prime_deadline_ns &&
+                         !dev->streams[ZG01_VOICE_IN].running;
         c->dev->prime_ready_ns = 0;
         c->dev->prime_released_frame = 0;
         c->dev->prime_in_first_ns = 0;
@@ -406,6 +407,14 @@ retry:
         spin_unlock_irqrestore(&dev->lock, flags);
         goto unlock;
     }
+    /* A fresh IN chain starts a new liveness window. Preserve OUT's
+     * pending IDs and inflight audio, but discard stale IN observations. */
+    dev->feedback.plan_head = 0;
+    dev->feedback.plans = 0;
+    dev->have_last_plan = false;
+    dev->feedback_started = false;
+    dev->feedback_gap_urbs = 0;
+    dev->feedback_startup_urbs = 0;
     WRITE_ONCE(c->state, ZG01_CHAIN_STARTING);
     spin_unlock_irqrestore(&dev->lock, flags);
 
@@ -912,11 +921,10 @@ static void zg01_feedback_xrun_all(struct zg01_dev *dev)
     zg01_feedback_xrun_locked(dev, true);
 }
 
-/* Prime readiness: first valid IN plan of this epoch plus settle.
- * In playback-only the IN chain is started briefly (in_assist) to
- * provide this signal, then stopped once priming releases. The
- * IN-restart pops that keep IN off mid-stream cannot be heard while
- * the output is still priming silence. Called with dev->lock held. */
+/* Experimental release heuristic: first valid IN plan plus settle.
+ * Playback-only starts briefly run IN (in_assist) for this observation.
+ * Valid transport does not prove audible readiness, and digital silence
+ * does not rule out firmware-generated pops. dev->lock must be held. */
 #define ZG01_PRIME_READY_SETTLE_MS 50
 
 static bool zg01_prime_ready(struct zg01_dev *dev, u64 now)
@@ -946,15 +954,8 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
 
     if (dev->feedback_fault)
         return;
-    /* EXPERIMENT free-run: with IN off (playback-only), no plans will
-     * ever arrive. Skip priming and the plan-gap faulting; submit the
-     * nominal 6-frame cadence directly. URB ids still recycle through
-     * the pending ring, which is OUT-side bookkeeping. */
-    if (!zg01_chain_active(&dev->in_chain)) {
-        if (!dev->feedback_started)
-            dev->feedback_started = true;
-        dev->have_last_plan = true;
-    }
+    /* Playback-only free-run needs no IN plans. Keep its bookkeeping
+     * separate from IN liveness: only valid IN sets feedback_started. */
     /* feedback_started latches on the first valid IN plan (see the
      * push path in zg01_iso_in), not here: invalid IN URBs before
      * any valid plan must keep the bounded startup tolerance below
@@ -963,6 +964,8 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
            atomic_read(&c->inflight) < 2) {
         bool gap_fallback = false;
         bool defer = false;
+        bool free_run = !zg01_chain_active(&dev->in_chain);
+
         nonzero_urb = false;
 
         if (q->plans && q->pending) {
@@ -970,25 +973,29 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
             for (i = 0; i < ISO_PKTS_OUT; i++)
                 total += q->plan[q->plan_head].frames[i];
             dev->feedback_gap_urbs = 0;
-        } else if ((dev->have_last_plan && dev->feedback_started) ||
+        } else if (free_run ||
+                   (dev->have_last_plan && dev->feedback_started) ||
                    (!dev->feedback_started &&
                     zg01_chain_active(&dev->in_chain))) {
-            /* Plan gap: keep OUT cadence on the last measured framing
-             * for the bounded fallback window.  This is a continuity
-             * policy, not a measured rate-error guarantee.
-             * Startup is the same shape with no last plan yet: submit
-             * nominal cadence at once instead of waiting for the first
-             * IN plan. Windows reaches full rate in 6-8 ms with no
-             * plan wait. The bound below caps a dead IN path. */
+            /* Submit nominal cadence during startup and short IN gaps.
+             * Windows ETW shows full-size initial transfers after EP0
+             * setup (../captures/zg01-cycle-transfers.tsv); it does not
+             * establish internal feedback policy or audible readiness.
+             * The bound below caps an active but unresponsive IN path. */
             total = 0;
-            for (i = 0; i < ISO_PKTS_OUT; i++)
-                total += dev->last_plan.frames[i];
+            if (dev->have_last_plan && dev->feedback_started) {
+                for (i = 0; i < ISO_PKTS_OUT; i++)
+                    total += dev->last_plan.frames[i];
+            } else {
+                /* No plan yet: size from the nominal six-frame cadence. */
+                total = 6 * ISO_PKTS_OUT;
+            }
             gap_fallback = true;
             /* Bound fallback to ~500 ms without a fresh valid plan,
              * then fault playback instead of repeating stale timing.
              * EXPERIMENT: no IN chain means no plans can ever arrive;
              * the bound does not apply. */
-            if (zg01_chain_active(&dev->in_chain) &&
+            if (!free_run &&
                 dev->feedback_gap_urbs >= ZG01_GAP_FALLBACK_MAX_URBS) {
                 dev->out_chain.stats.feedback_starved++;
                 zg01_feedback_xrun(dev);
@@ -1050,17 +1057,12 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         } else if (!zg01_feedback_take(q, &plan, &id)) {
             return;
         }
-        /* The ZG01 pops on odd-sized OUT packets. The device's IN
-         * endpoint reports its framing honestly (5-7 frames/packet,
-         * ~+21ppm clock drift producing isolated 7-frame packets every
-         * ~1s), but the output side clicks audibly whenever an
-         * odd-sized packet lands. Windows captures show the same:
-         * 280 B seven-frame inserts at ~1.13/s (~23 ppm) on an
-         * otherwise steady 240 B stream. Absorb drift device-side
-         * instead: send the nominal 6 frames per packet regardless
-         * of the measured plan. The plan is still taken (and counted)
-         * so feedback stats and gap-fallback liveness stay intact; only
-         * the sizing is ignored. */
+        /* Linux trials associated variable OUT sizes with clicks, so
+         * this workaround uses fixed six-frame packets. Windows ETW
+         * instead shows occasional larger OUT transfers consistent with
+         * seven-frame inserts (../captures/zg01-cycle-transfers.tsv).
+         * ETW sizes do not prove clicks or a device drift-absorption
+         * mechanism. Consume IN plans for liveness, not OUT sizing. */
         for (i = 0; i < ISO_PKTS_OUT; i++)
             plan.frames[i] = 6;
         urb = c->urbs[id];
@@ -1069,7 +1071,7 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         /* Priming window: the device discards early audio. Consume and
          * drop the application's frames (silence stays in the buffer)
          * so ALSA's clock advances normally through the window.
-         * Release early on device readiness, else at the deadline cap. */
+         * Release on the transport heuristic or at the deadline cap. */
         if (dev->prime_deadline_ns) {
             u64 now = ktime_get_ns();
 
@@ -1150,7 +1152,7 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         }
         if (submit_has_audio && !c->stats.first_nonzero_submit_ns)
             c->stats.first_nonzero_submit_ns = ktime_get_ns();
-        if (gap_fallback)
+        if (gap_fallback && !free_run)
             dev->feedback_gap_urbs++;
         for (n = 0; n < 2; n++) {
             if (!used[n])
@@ -1372,6 +1374,10 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
         ? &dev->in_chain : &dev->out_chain;
     unsigned long flags;
 
+    /* Close can extend the hold again after hw_free. Join any expired
+     * callback outside state_mutex before publishing that extension. */
+    cancel_delayed_work_sync(&dev->out_chain.quiesce_work);
+    cancel_delayed_work_sync(&dev->in_chain.quiesce_work);
     mutex_lock(&dev->state_mutex);
     s->opened = false;
     s->running = false;
@@ -1430,15 +1436,10 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
         ? &dev->in_chain : &dev->out_chain;
     unsigned long flags;
 
-    /* Warm-hold cancel runs outside state_mutex: quiesce takes it.
-     * Skip the OUT cancel when keepalive will re-arm it below —
-     * otherwise this cancel kills the hold it is about to schedule
-     * (mod_delayed_work from the close paths, plus any hold left by
-     * the preceding STOP, must survive into the keepalive window). */
-    if (!(c == &dev->out_chain && keepalive_ms &&
-          !dev->streams[ZG01_VOICE_IN].running &&
-          !dev->streams[ZG01_VOICE_IN].opened))
-        cancel_delayed_work_sync(&dev->out_chain.quiesce_work);
+    /* Join old quiesce callbacks before extending the hold. Re-arming
+     * delayed work does not revoke an already-running invocation.
+     * Join outside state_mutex because quiesce takes that mutex. */
+    cancel_delayed_work_sync(&dev->out_chain.quiesce_work);
     cancel_delayed_work_sync(&dev->in_chain.quiesce_work);
 
     mutex_lock(&dev->state_mutex);
@@ -1528,8 +1529,9 @@ static int zg01_pcm_prepare(struct snd_pcm_substream *substream)
         dev->device_initialized = true;
     }
 
-    /* Playback also owns IN for implicit feedback. Never reset a live
-     * interface when capture joins/leaves or either playback PCM joins. */
+    /* Prepare both endpoints: capture needs paired OUT, and playback
+     * may request IN assist. Never reset a live interface when a sibling
+     * PCM joins. Reuse an interface that already has the required alt. */
     if (READ_ONCE(dev->in_chain.state) == ZG01_CHAIN_STOPPED) {
         struct usb_interface *iface;
 
@@ -1548,7 +1550,7 @@ static int zg01_pcm_prepare(struct snd_pcm_substream *substream)
     }
     ret = zg01_chain_alloc(dev, &dev->in_chain, ZG01_EP_IN, 2,
                            ISO_PKTS_IN, ISO_PKT_SIZE_IN, false);
-    if (!ret && s->direction != SNDRV_PCM_STREAM_CAPTURE) {
+    if (!ret) {
         if (READ_ONCE(dev->out_chain.state) == ZG01_CHAIN_STOPPED) {
             struct usb_interface *iface;
 
@@ -1616,58 +1618,34 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
         s->xrun_generation = 0;
         s->queued_pos = s->pcm_pos;
         s->queued_ptr = substream->runtime->status->hw_ptr;
+        /* Capture owns OUT even when it joins existing playback. */
+        if (c == &dev->in_chain)
+            dev->out_silence = true;
         spin_unlock_irqrestore(&dev->lock, flags);
         mutex_unlock(&dev->state_mutex);
 
         /* May sleep (cleanup drain); state re-checked inside. */
         ret = zg01_chain_start(dev, c);
-        /* Capture owns an OUT silence epoch when no playback runs:
-         * Windows never runs IN alone, both iso pipes always pair. */
-        if (!ret && c == &dev->in_chain &&
-            !dev->streams[ZG01_GAME].running &&
-            !dev->streams[ZG01_VOICE_OUT].running) {
-            spin_lock_irqsave(&dev->lock, flags);
-            dev->out_silence = true;
-            spin_unlock_irqrestore(&dev->lock, flags);
+        /* Start or adopt OUT for capture. Windows capture-only traffic
+         * uses both iso pipes (../captures/AUDIO_PACKET_ANALYSIS.md).
+         * Our OUT pump supplies silence when no playback runs. */
+        if (!ret && c == &dev->in_chain)
             ret = zg01_chain_start(dev, &dev->out_chain);
-            if (ret == -ECANCELED)
-                ret = 0;
-            if (ret) {
-                spin_lock_irqsave(&dev->lock, flags);
-                dev->out_silence = false;
-                spin_unlock_irqrestore(&dev->lock, flags);
-            }
-        }
         /* EXPERIMENT: IN runs for capture, and briefly as prime
          * readiness signal (in_assist) on fresh playback-only
          * epochs. Warm adoption of a RUNNING OUT chain starts no new
          * epoch and needs no assist. */
         if (!ret && c == &dev->out_chain) {
-            if (!dev->streams[ZG01_VOICE_IN].running &&
-                READ_ONCE(dev->prime_deadline_ns)) {
-                spin_lock_irqsave(&dev->lock, flags);
-                /* Fresh epoch only: a warm-held chain may still carry
-                 * an unreleased deadline from its previous epoch.
-                 * Compare the latched epoch of that deadline against
-                 * the current one so adoption never re-arms assist. */
-                if (dev->prime_deadline_ns &&
-                    dev->prime_epoch == dev->out_chain.stats.start_epoch &&
-                    !dev->in_assist) {
-                    dev->in_assist = true;
-                    dev->prime_in_first_ns = 0;
-                }
-                spin_unlock_irqrestore(&dev->lock, flags);
-            }
             ret = zg01_chain_start(dev, &dev->in_chain);
             if (ret == -ECANCELED)
                 ret = 0;
-            if (!ret) {
-                /* Playback-only has no IN callback to drive the first
-                 * OUT submission. Pump after START publishes RUNNING. */
-                spin_lock_irqsave(&dev->lock, flags);
-                zg01_feedback_pump(dev);
-                spin_unlock_irqrestore(&dev->lock, flags);
-            }
+        }
+        if (!ret) {
+            /* Submit OUT immediately in every mode, including capture.
+             * IN callbacks are not required to kick the initial batch. */
+            spin_lock_irqsave(&dev->lock, flags);
+            zg01_feedback_pump(dev);
+            spin_unlock_irqrestore(&dev->lock, flags);
         }
         if (ret) {
             mutex_lock(&dev->state_mutex);
@@ -1675,6 +1653,8 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
             spin_lock_irqsave(&dev->lock, flags);
             s->enabled = false;
             s->xrun_generation = 0;
+            if (c == &dev->in_chain)
+                dev->out_silence = false;
             if (c == &dev->out_chain &&
                 !dev->streams[ZG01_GAME].running &&
                 !dev->streams[ZG01_VOICE_OUT].running)
