@@ -49,6 +49,22 @@ two playback PCMs stay separate sinks.
 - Hold demand must survive DRAINING while chain_start joins cleanup.
   Failed starts and capture takeover release both flags. Suspend/disconnect
   block late arming. Expiry cannot revoke a hold adopted by live playback.
+- A runtime write of 0 to `keepalive_ms` takes effect at the next close/hw_free:
+  that path revokes driver-owned demand before the no-consumer stop checks.
+- The storm holdback is an eligible nominal-fallback state, so a cleared cached
+  plan never strands RUNNING OUT at zero submissions. DRAINING blocks submission.
+- The spread budget ignores a DRAINING consumer: a short terminating stream must
+  not shrink a healthy RUNNING sibling's plan. A lone draining stream still
+  spreads, which keeps its own tail hole away.
+- Assist and prime release clear only their own IN ownership. Keep IN while real
+  capture (`enabled`) or `in_hold` owns it; never test mutex-only `running` from
+  the pump, which runs under `dev->lock`.
+- The idle-fault re-arm delay is per-device under `dev->lock`: it starts at
+  `keepalive_rearm_ms`, doubles to `keepalive_rearm_max` with capped
+  arithmetic, and resets only on an explicit successful START or a PM reset —
+  never on an automatic keepalive restart.
+- `WQ_PERCPU` exists only from v6.17. `ZG01_WQ_PERCPU` guards it with a version
+  test; `#ifdef` cannot detect an enum constant.
 - `prime_ms` defaults to 0. Enabling it drops application frames during
   silence priming. Valid IN plus 50 ms is an experimental release heuristic,
   not proof of audible readiness. Warm adoption does not re-arm assist.
@@ -101,6 +117,12 @@ Suspend stops both chains and forces re-init on the next prepare;
   Terminal resubmit statuses still drain. See `docs/STARTUP_RECOVERY.md`.
 - Do not count free-run completions as feedback starvation. Count a transport
   fault once per OUT fault latch, but preserve notifications to real capture.
+- Count `silence_frames` from the final submitted plan, never from the requested
+  total: frames the spread withheld are `even_fill_deficit`, and `short_hold`
+  sends a repeated frame instead of a zero one.
+- Keep workqueue flags compatible with the oldest supported kernel. The project
+  advertises Debian/Ubuntu builds on matching headers, and `WQ_PERCPU` does not
+  exist before v6.17.
 - The Makefile auto-detects clang kernels via `CONFIG_CC_IS_CLANG`. Do not
   hardcode `LLVM=1`.
 - Do not add `EXPORT_SYMBOL` for intra-module symbols.

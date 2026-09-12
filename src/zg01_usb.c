@@ -11,11 +11,27 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/version.h>
 #include <linux/workqueue.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 
 #include "zg01.h"
+
+/*
+ * WQ_PERCPU names the explicit CPU binding of a workqueue. It first appeared
+ * in v6.17 and alloc_workqueue() reads it from 6.18 on; the warning that
+ * motivated an explicit binding arrived later still (v7.2). Kernels without
+ * the identifier bind an unbound-free queue to the local CPU implicitly, which
+ * is the behaviour these queues always had. The identifier is an enum
+ * constant, not a preprocessor macro, so only a version test can detect it:
+ * 0 keeps the legacy implicit per-CPU binding.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+#define ZG01_WQ_PERCPU WQ_PERCPU
+#else
+#define ZG01_WQ_PERCPU 0
+#endif
 
 struct workqueue_struct *zg01_cleanup_wq;
 struct workqueue_struct *zg01_period_wq;
@@ -313,15 +329,19 @@ static int __init zg01_init(void)
     int ret;
 
     /*
-     * Name an explicit CPU binding. Recent kernels warn when a workqueue
-     * sets neither WQ_PERCPU nor WQ_UNBOUND, and WQ_PERCPU keeps the
-     * behaviour these queues have always had.
+     * Name an explicit CPU binding where the kernel supports it. Recent
+     * kernels warn when a workqueue sets neither WQ_PERCPU nor WQ_UNBOUND,
+     * and WQ_PERCPU keeps the behaviour these queues have always had;
+     * ZG01_WQ_PERCPU is 0 on kernels older than v6.17, whose alloc_workqueue
+     * binds to the local CPU implicitly.
      */
-    zg01_cleanup_wq = alloc_workqueue("zg01-cleanup", WQ_MEM_RECLAIM | WQ_PERCPU, 0);
+    zg01_cleanup_wq = alloc_workqueue("zg01-cleanup",
+                                      WQ_MEM_RECLAIM | ZG01_WQ_PERCPU, 0);
     if (!zg01_cleanup_wq)
         return -ENOMEM;
 
-    zg01_period_wq = alloc_workqueue("zg01-period", WQ_MEM_RECLAIM | WQ_PERCPU, 0);
+    zg01_period_wq = alloc_workqueue("zg01-period",
+                                     WQ_MEM_RECLAIM | ZG01_WQ_PERCPU, 0);
     if (!zg01_period_wq) {
         destroy_workqueue(zg01_cleanup_wq);
         zg01_cleanup_wq = NULL;

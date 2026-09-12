@@ -192,13 +192,37 @@ static bool zg01_hold_warm(bool draining)
  * device output path live — OUT silence alone, EP0 requests, control
  * heartbeats, and bulk polls all failed to. So the hold now also
  * keeps the IN chain cycling (driver-owned, no capture substream):
- * the device stays in its IN+OUT live state through the window. */
-static bool zg01_hold_across_close(struct zg01_dev *dev)
+ * the device stays in its IN+OUT live state through the window.
+ * The caller passes the SAME parameter decision it used for the revoke, so a
+ * concurrent runtime write cannot cancel the expiry yet leave the hold armed. */
+static bool zg01_hold_across_close(struct zg01_dev *dev, bool keepalive_on)
 {
-    return READ_ONCE(keepalive_ms) && !atomic_read(&dev->disconnecting) &&
+    return keepalive_on && !atomic_read(&dev->disconnecting) &&
            !dev->suspended && dev->device_initialized &&
            !dev->streams[ZG01_VOICE_IN].running &&
            !dev->streams[ZG01_VOICE_IN].opened;
+}
+
+/* Runtime keepalive disable revokes stale driver-owned demand.
+ *
+ * close and hw_free cancel the quiesce expiry synchronously, and with
+ * keepalive_ms at 0 no replacement is armed. A hold armed while the parameter
+ * was non-zero would otherwise keep both chains streaming with no consumer
+ * and no expiry, so revoke the disabled demand before the no-consumer stop
+ * checks. Real playback, capture, and assist ownership are separate.
+ * The caller reads the parameter once and passes the decision here and to
+ * zg01_hold_across_close(): two independent reads could see 0 in one place and
+ * non-zero in the other, which is the leak this helper exists to prevent. */
+static void zg01_hold_revoke_disabled(struct zg01_dev *dev, bool keepalive_on)
+{
+    unsigned long flags;
+
+    if (keepalive_on)
+        return;
+    spin_lock_irqsave(&dev->lock, flags);
+    WRITE_ONCE(dev->out_hold, false);
+    WRITE_ONCE(dev->in_hold, false);
+    spin_unlock_irqrestore(&dev->lock, flags);
 }
 
 static int zg01_chain_start(struct zg01_dev *dev, struct zg01_chain *c);
@@ -222,6 +246,49 @@ module_param(keepalive_rearm_max, uint, 0644);
 MODULE_PARM_DESC(keepalive_rearm_max, "Upper bound of the re-arm backoff in ms (default 60000)");
 
 static void zg01_keepalive_arm(struct zg01_dev *dev);
+
+/* Capped doubling for the idle-fault re-arm delay. A zero cap disables
+ * growth, so the delay stays at the configured initial value. */
+static unsigned int zg01_rearm_next_delay(unsigned int delay, unsigned int cap)
+{
+    if (!cap)
+        return delay;
+    if (delay >= cap)
+        return cap;
+    if (delay > cap / 2)
+        return cap;
+    return delay * 2;
+}
+
+/* Schedule one keepalive re-arm after an idle fault. Called with dev->lock
+ * held: the fault paths run in callback context and must not sleep. The delay
+ * starts at the configured keepalive_rearm_ms and doubles per fault up to
+ * keepalive_rearm_max, so a persistently failing idle device is retried with
+ * decreasing frequency instead of a constant short interval. History is
+ * per-device and resets only on an explicit successful PCM START or a PM
+ * reset, never on an automatic keepalive restart.
+ * This runs in callback context under dev->lock. `suspended` belongs to
+ * state_mutex, so it is a snapshot here: a false read only queues work that
+ * the keepalive gate re-checks under state_mutex. */
+static void zg01_rearm_schedule_locked(struct zg01_dev *dev)
+{
+    unsigned int cap, delay;
+
+    if (!READ_ONCE(keepalive_rearm_ms) || dev->keepalive_rearm ||
+        dev->streams[ZG01_VOICE_IN].enabled ||
+        atomic_read(&dev->disconnecting) || READ_ONCE(dev->suspended))
+        return;
+    cap = READ_ONCE(keepalive_rearm_max);
+    delay = dev->rearm_delay_ms;
+    if (!delay)
+        delay = READ_ONCE(keepalive_rearm_ms);
+    if (cap && delay > cap)
+        delay = cap;                     /* parameter shrank at runtime */
+    dev->rearm_delay_ms = zg01_rearm_next_delay(delay, cap);
+    dev->keepalive_rearm = true;
+    mod_delayed_work(zg01_cleanup_wq, &dev->keepalive_rearm_work,
+                     msecs_to_jiffies(delay));
+}
 
 void zg01_keepalive_rearm_fn(struct work_struct *work)
 {
@@ -252,6 +319,7 @@ static void zg01_keepalive_arm(struct zg01_dev *dev)
     unsigned long flags;
     int ret;
     bool playback_running;
+    bool keepalive_on;
 
     /* Join old expiry work before publishing new demand. */
     cancel_delayed_work_sync(&dev->out_chain.quiesce_work);
@@ -260,7 +328,19 @@ static void zg01_keepalive_arm(struct zg01_dev *dev)
     mutex_lock(&dev->state_mutex);
     playback_running = dev->streams[ZG01_GAME].running ||
                         dev->streams[ZG01_VOICE_OUT].running;
-    if (!zg01_hold_across_close(dev)) {
+    keepalive_on = READ_ONCE(keepalive_ms) != 0;
+    if (!zg01_hold_across_close(dev, keepalive_on)) {
+        /* The caller's decision can be stale, and this gate runs after it
+         * cancelled the old expiry: a runtime write of 0 may land in between.
+         * Revoke the disabled demand here too and stop what no consumer owns,
+         * or an ownerless pair keeps streaming with no timer. The other gate
+         * failures (capture, suspend, disconnect) already released or never
+         * owned these flags, so the revoke is a no-op for them. */
+        zg01_hold_revoke_disabled(dev, keepalive_on);
+        if (!chain_consumers_running(dev, &dev->out_chain))
+            zg01_chain_stop(dev, &dev->out_chain);
+        if (!chain_consumers_running(dev, &dev->in_chain))
+            zg01_chain_stop(dev, &dev->in_chain);
         mutex_unlock(&dev->state_mutex);
         return;
     }
@@ -308,7 +388,7 @@ static void zg01_keepalive_arm(struct zg01_dev *dev)
 
     mutex_lock(&dev->state_mutex);
     spin_lock_irqsave(&dev->lock, flags);
-    if (ret || !zg01_hold_across_close(dev) ||
+    if (ret || !zg01_hold_across_close(dev, READ_ONCE(keepalive_ms) != 0) ||
         !dev->out_hold || !dev->in_hold || dev->feedback_fault ||
         !zg01_chain_active(&dev->out_chain) ||
         !zg01_chain_active(&dev->in_chain)) {
@@ -987,7 +1067,7 @@ static void zg01_usb_stats_account(struct zg01_usb_stats *s,
         } else if (p->actual_length != p->length) {
             s->out_length_mismatch++;
             s->last_error_ns = now;
-        } else if (p->length >= 200 && p->length <= 280 && !(p->length % 40)) {
+        } else if (p->length >= 40 && p->length <= 280 && !(p->length % 40)) {
             s->out_frames[p->length / 40]++;
         }
     }
@@ -1244,6 +1324,7 @@ struct out_consumer {
     struct snd_pcm_runtime *rt;
     unsigned int available;
     bool active;
+    bool draining;
 };
 
 static void snap_consumer(struct zg01_dev *dev, enum zg01_stream_id id,
@@ -1259,6 +1340,8 @@ static void snap_consumer(struct zg01_dev *dev, enum zg01_stream_id id,
         return;
     oc->rt = sub->runtime;
     oc->active = true;
+    /* A draining stream only has a terminating tail left. */
+    oc->draining = oc->rt->status->state == SNDRV_PCM_STATE_DRAINING;
     oc->available = zg01_playback_available(READ_ONCE(oc->rt->control->appl_ptr),
                          s->queued_ptr, oc->rt->boundary, oc->rt->buffer_size);
 }
@@ -1293,17 +1376,9 @@ static void zg01_feedback_xrun_locked(struct zg01_dev *dev, bool include_capture
     /* Driver-owned pair died with no consumer attached: schedule one
      * keepalive re-arm after a backoff instead of leaving the device
      * cold for the session. Real streams above keep their own
-     * recovery paths; a rearm already pending wins. */
-    if (keepalive_rearm_ms && !dev->keepalive_rearm &&
-        !dev->streams[ZG01_VOICE_IN].enabled &&
-        !atomic_read(&dev->disconnecting) && !dev->suspended) {
-        unsigned int backoff = min(keepalive_rearm_ms << 1,
-                                   keepalive_rearm_max);
-
-        dev->keepalive_rearm = true;
-        mod_delayed_work(zg01_cleanup_wq, &dev->keepalive_rearm_work,
-                         msecs_to_jiffies(backoff));
-    }
+     * recovery paths; a rearm already pending wins. The helper owns the
+     * gate, the per-device delay, and the pending-flag publication. */
+    zg01_rearm_schedule_locked(dev);
 
     /* OUT faults do not stop real capture. IN-chain death notifies
      * all consumers, including capture after an earlier OUT fault. */
@@ -1380,9 +1455,15 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         bool gap_fallback = false;
         bool defer = false;
         bool free_run = !zg01_chain_active(&dev->in_chain);
+        /* A cached plan is only usable while IN still supplies feedback.
+         * Holdback clears it on purpose, so a missing plan must keep OUT on
+         * the nominal cadence instead of blocking submission. */
+        bool use_last_plan = false;
+        bool flatten_plans = READ_ONCE(ignore_plans) != 0;
         bool short_event[2] = { false, false };
         u8 hold_frame[2][8] = { { 0 }, { 0 } };
         bool have_hold_frame[2] = { false, false };
+        unsigned int zero_pad[2] = { 0, 0 };
 
         nonzero_urb = false;
 
@@ -1394,14 +1475,20 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         } else if (free_run ||
                    (dev->have_last_plan && dev->feedback_started) ||
                    (!dev->feedback_started &&
-                    zg01_chain_active(&dev->in_chain))) {
+                    zg01_chain_active(&dev->in_chain)) ||
+                   dev->free_run_holdback) {
             /* Submit nominal cadence during startup and short IN gaps.
              * Windows ETW shows full-size initial transfers after EP0
              * setup (../captures/zg01-cycle-transfers.tsv); it does not
              * establish internal feedback policy or audible readiness.
-             * The bound below caps an active but unresponsive IN path. */
+             * The bound below caps an active but unresponsive IN path.
+             * Holdback is one of those states: OUT free-runs on the nominal
+             * cadence until a valid plan returns, so it must stay eligible
+             * for scheduling instead of stranding RUNNING OUT. */
             total = 0;
-            if (dev->have_last_plan && dev->feedback_started) {
+            use_last_plan = !free_run && dev->have_last_plan &&
+                            dev->feedback_started;
+            if (use_last_plan) {
                 for (i = 0; i < ISO_PKTS_OUT; i++)
                     total += dev->last_plan.frames[i];
             } else {
@@ -1425,13 +1512,18 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                 if (!free_run && dev->feedback_gap_urbs >= gap_limit) {
                     if (grace && (dev->streams[ZG01_VOICE_IN].enabled ||
                                   READ_ONCE(dev->in_hold))) {
-                        /* Storm under real capture: free-run OUT on
-                         * nominal cadence instead of faulting it.
-                         * Log once per holdback; a valid plan lifts
-                         * it and restores feedback pacing. */
+                        /* Intentional but unresponsive IN: free-run OUT
+                         * on nominal cadence instead of faulting it.
+                         * Log once per holdback; a valid plan lifts it
+                         * and restores feedback pacing. Drop the cached
+                         * plan together with the holdback and lower the
+                         * sizing here, so the budget check above and the
+                         * submitted plan both use the nominal cadence. */
                         if (!dev->free_run_holdback) {
                             dev->free_run_holdback = true;
                             dev->have_last_plan = false;
+                            use_last_plan = false;
+                            total = 6 * ISO_PKTS_OUT;
                             dev_info(&dev->udev->dev,
                                      "IN storm under capture: OUT free-running\n");
                         }
@@ -1446,6 +1538,9 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         } else {
             break;
         }
+        /* Admission must use the same sizing policy as the final plan. */
+        if (flatten_plans)
+            total = 6 * ISO_PKTS_OUT;
         snap_consumer(dev, ZG01_GAME, &oc[0]);
         snap_consumer(dev, ZG01_VOICE_OUT, &oc[1]);
         for (n = 0; n < 2; n++) {
@@ -1485,12 +1580,14 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
             c->stats.playback_defer++;
             return;
         }
-        if (gap_fallback)
+        /* Starvation means an ACTIVE IN path is not producing usable plans.
+         * Playback-only free-run has no feedback source and is not starved. */
+        if (gap_fallback && !free_run)
             c->stats.feedback_starved++;
         if (gap_fallback) {
-            /* Startup has no last plan, so use nominal sizing then.
-             * Later gaps repeat only a previously validated plan. */
-            if (dev->have_last_plan && dev->feedback_started)
+            /* Startup and holdback have no usable cached plan, so size from
+             * the nominal six-frame cadence instead. */
+            if (use_last_plan)
                 plan = dev->last_plan;
             else
                 memset(&plan, 6, sizeof(plan));
@@ -1506,7 +1603,7 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
          * from. Running it afterwards re-inflated a spread URB back to
          * nominal and returned the tail hole (measured: 14 events of 64
          * frames in a 15 s window with both options on). */
-        if (ignore_plans) {
+        if (flatten_plans) {
             for (i = 0; i < ISO_PKTS_OUT; i++) {
                 if (plan.frames[i] != 6) {
                     plan.frames[i] = 6;
@@ -1517,12 +1614,29 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
         if (even_fill && !priming) {
             unsigned int plan_total = 0;
             unsigned int budget = UINT_MAX;
+            unsigned int drain_budget = UINT_MAX;
 
             for (i = 0; i < ISO_PKTS_OUT; i++)
                 plan_total += plan.frames[i];
-            for (n = 0; n < 2; n++)
-                if (oc[n].active && limit[n] < budget)
+            /* A DRAINING consumer has only a short terminating tail left.
+             * Taking its frame count as the common budget would shrink the
+             * shared plan and starve a healthy RUNNING sibling: upstream
+             * keeps the full plan and pads the terminating slot instead.
+             * A lone draining stream has no sibling to protect, so it keeps
+             * the spread that avoids padding its own tail. */
+            for (n = 0; n < 2; n++) {
+                if (!oc[n].active)
+                    continue;
+                if (oc[n].draining) {
+                    if (limit[n] < drain_budget)
+                        drain_budget = limit[n];
+                    continue;
+                }
+                if (limit[n] < budget)
                     budget = limit[n];
+            }
+            if (budget == UINT_MAX)
+                budget = drain_budget;
             /* The vendor only takes its spread branch when the frame
              * count covers every descriptor; below that it keeps nominal
              * sizing, so mirror that and never emit zero-length packets.
@@ -1550,7 +1664,12 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
             dev->assist_deadline_ns = 0;
             if (dev->in_assist) {
                 dev->in_assist = false;
-                if (!dev->streams[ZG01_VOICE_IN].running)
+                /* Release assist ownership only. Callback-side checks use
+                 * dev->lock-owned demand, never the mutex-only running
+                 * field: a sibling close may have taken the keepalive IN
+                 * hold, and real capture owns IN independently. */
+                if (!dev->streams[ZG01_VOICE_IN].enabled &&
+                    !READ_ONCE(dev->in_hold))
                     zg01_chain_drain_locked(&dev->in_chain);
             }
         }
@@ -1579,7 +1698,11 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                  * IN-restart pops. */
                 if (dev->in_assist) {
                     dev->in_assist = false;
-                    if (!dev->streams[ZG01_VOICE_IN].running)
+                    /* Release assist ownership only: keep the chain while
+                     * a callback-visible capture or keepalive owner
+                     * remains. */
+                    if (!dev->streams[ZG01_VOICE_IN].enabled &&
+                        !READ_ONCE(dev->in_hold))
                         zg01_chain_drain_locked(&dev->in_chain);
                 }
             } else {
@@ -1613,9 +1736,13 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
                             c->stats.out_short_last_index[n] = i;
                         }
                         c->stats.out_short_frames[n]++;
-                        if (short_hold && !priming && have_hold_frame[n])
+                        if (short_hold && !priming && have_hold_frame[n]) {
                             memcpy(pkt + f * 40 + (n == 0 ? 8 : 0),
                                    hold_frame[n], 8);
+                        } else {
+                            /* This slot frame leaves the driver as silence. */
+                            zero_pad[n]++;
+                        }
                         continue;
                     }
                     off = ((s->queued_pos + used[n]) % oc[n].rt->buffer_size) * 8;
@@ -1643,11 +1770,14 @@ static void zg01_feedback_pump(struct zg01_dev *dev)
             }
         }
         for (n = 0; n < 2; n++) {
-            if (oc[n].active && used[n] < total)
-                c->stats.silence_frames += total - used[n];
             c->completed_frames[id][n] = used[n];
             c->generation[id][n] = oc[n].s->generation;
         }
+        /* Count only slot frames that leave as zeros, taken after the final
+         * plan was rewritten: frames the spread withheld are an
+         * under-delivery (even_fill_deficit), not transmitted silence, and
+         * short_hold sends a repeated frame instead of a zero one. */
+        c->stats.silence_frames += zero_pad[0] + zero_pad[1];
         atomic_inc(&c->inflight);
         submit_has_audio = nonzero_urb;
         ret = usb_submit_urb(urb, GFP_ATOMIC);
@@ -1922,6 +2052,7 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
     struct zg01_chain *c = (s->direction == SNDRV_PCM_STREAM_CAPTURE)
         ? &dev->in_chain : &dev->out_chain;
     bool arm_keepalive_in = false;
+    bool keepalive_on;
     unsigned long flags;
 
     /* Close can extend the hold again after hw_free. Join any expired
@@ -1939,7 +2070,12 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
     if (c == &dev->in_chain)
         dev->out_silence = false;
     spin_unlock_irqrestore(&dev->lock, flags);
-    if (c == &dev->out_chain && zg01_hold_across_close(dev)) {
+    /* A runtime-disabled keepalive must not outlive the expiry this close
+     * just cancelled: revoke driver-owned demand before the stop checks.
+     * One parameter read decides both the revoke and the hold below. */
+    keepalive_on = READ_ONCE(keepalive_ms) != 0;
+    zg01_hold_revoke_disabled(dev, keepalive_on);
+    if (c == &dev->out_chain && zg01_hold_across_close(dev, keepalive_on)) {
         /* The helper restarts both chains, then arms expiry. */
         arm_keepalive_in = true;
     } else if (!chain_consumers_running(dev, c)) {
@@ -1953,7 +2089,7 @@ static int zg01_pcm_close(struct snd_pcm_substream *substream)
      * close does, or the paired hold dies with every PipeWire capture
      * probe and idle IN never streams. */
     if (c == &dev->in_chain && !chain_consumers_running(dev, &dev->in_chain) &&
-        zg01_hold_across_close(dev)) {
+        zg01_hold_across_close(dev, keepalive_on)) {
         /* Also fires while playback runs: the IN-only arm path
          * restores IN liveness for a running OUT consumer. */
         arm_keepalive_in = true;
@@ -2002,6 +2138,7 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
     struct zg01_chain *c = (s->direction == SNDRV_PCM_STREAM_CAPTURE)
         ? &dev->in_chain : &dev->out_chain;
     bool arm_keepalive_in = false;
+    bool keepalive_on;
     unsigned long flags;
 
     /* Join old quiesce callbacks before extending the hold. Re-arming
@@ -2024,7 +2161,12 @@ static int zg01_pcm_hw_free(struct snd_pcm_substream *substream)
     if (c == &dev->in_chain)
         dev->out_silence = false;
     spin_unlock_irqrestore(&dev->lock, flags);
-    if (c == &dev->out_chain && zg01_hold_across_close(dev)) {
+    /* Same rule as close: never leave a disabled keepalive's hold behind
+     * a cancelled expiry. One parameter read decides both the revoke and
+     * the hold below. */
+    keepalive_on = READ_ONCE(keepalive_ms) != 0;
+    zg01_hold_revoke_disabled(dev, keepalive_on);
+    if (c == &dev->out_chain && zg01_hold_across_close(dev, keepalive_on)) {
         /* Keepalive: leave OUT cycling silence with no substream;
          * the quiesce timer stops it keepalive_ms later. IN joins
          * the hold: the device output path needs IN isoc liveness.
@@ -2218,8 +2360,13 @@ static int zg01_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
         }
         if (!ret) {
             /* Submit OUT immediately in every mode, including capture.
-             * IN callbacks are not required to kick the initial batch. */
+             * IN callbacks are not required to kick the initial batch.
+             * An application PCM START resets the idle-fault retry history,
+             * including a warm adoption of a driver-held chain. Automatic
+             * keepalive restarts and the re-arm worker do not, so a device
+             * that faults again keeps the longer delay. */
             spin_lock_irqsave(&dev->lock, flags);
+            dev->rearm_delay_ms = 0;
             zg01_feedback_pump(dev);
             spin_unlock_irqrestore(&dev->lock, flags);
         }
@@ -2472,6 +2619,7 @@ void zg01_suspend_pcm(struct zg01_dev *dev)
 void zg01_pm_reset_streams(struct zg01_dev *dev)
 {
     int i;
+    unsigned long flags;
 
     /*
      * The firmware reset itself across suspend: force the first-prepare
@@ -2481,6 +2629,9 @@ void zg01_pm_reset_streams(struct zg01_dev *dev)
     mutex_lock(&dev->state_mutex);
     for (i = 0; i < ZG01_N_STREAMS; i++)
         dev->streams[i].running = false;
+    spin_lock_irqsave(&dev->lock, flags);
+    dev->rearm_delay_ms = 0;
+    spin_unlock_irqrestore(&dev->lock, flags);
     dev->device_initialized = false;
     dev->suspended = false;
     mutex_unlock(&dev->state_mutex);
