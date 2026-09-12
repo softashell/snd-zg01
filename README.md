@@ -130,6 +130,7 @@ install. If a pre-2026 package left broken DKMS state, remove
 
 ## Documentation
 
+- `docs/MIC_MONITOR.md`: opt-in mic monitor level control and trace evidence
 - `docs/PROTOCOL_CAPTURE.md`: capture workflow for knobs, buttons, routing
 - `docs/INITIALIZATION_ANALYSIS.md`: device USB topology and packet formats
 - `packaging/arch/README.md`: Arch packaging, verification, rollback

@@ -17,6 +17,7 @@
 #include <sound/pcm.h>
 
 #include "zg01.h"
+#include "zg01_control.h"
 
 /*
  * WQ_PERCPU names the explicit CPU binding of a workqueue. It first appeared
@@ -189,6 +190,11 @@ static int zg01_probe(struct usb_interface *interface,
                      "interface %d not claimed: %d\n", i, err);
         else if (!err)
             dev_info(&interface->dev, "claimed interface %d\n", i);
+        if (!err && i == 4) {
+            err = zg01_init_mic_monitor(aux);
+            if (err)
+                dev_warn(&interface->dev, "mic monitor control unavailable: %d\n", err);
+        }
     }
 
     dev_info(&interface->dev, "ZG01 card created (3 PCM devices)\n");
@@ -205,6 +211,11 @@ static void zg01_disconnect(struct usb_interface *interface)
     int i;
     int ret;
 
+    /* Interface 1 owns the attribute. Releasing the claimed interfaces 3 and
+     * 4 below runs their own disconnect, so removing here again would touch
+     * an unregistered device. */
+    if (interface->cur_altsetting->desc.bInterfaceNumber == 1)
+        zg01_remove_mic_monitor(interface);
     if (!dev)
         return;
 
